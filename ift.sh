@@ -20,6 +20,7 @@
 # 0.1.0 - initial version (not numbered)
 # 0.2.0 - added debug flag (-d), direct format flags (-mp3, -aac), version (-v) and help (-h),
 #         error handling with clear guidance for debugging
+# 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
 
 set -euo pipefail
 
@@ -32,29 +33,29 @@ show_help=false
 # --- Parse command-line options ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -aac) target="aac" ;;         # set target to AAC
-        -mp3) target="mp3" ;;         # set target to MP3
-        -d)   debug=true ;;           # enable debug log
-        -v)   show_version=true ;;   # print version
-        -h)   show_help=true ;;      # print help
+        -aac) target="aac" ;;
+        -mp3) target="mp3" ;;
+        -d)   debug=true ;;
+        -v)   show_version=true ;;
+        -h)   show_help=true ;;
         *)    echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
 done
 
 if $show_version; then
-    echo "ift.sh version 0.2.0"
+    echo "ift.sh version 0.2.1"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.2.0
+Version 0.2.1
 
 Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
-  -aac    Directly transcode to AAC (fdkaac, adaptive VBR, 16-bit 44.1kHz or 48kHz)
+  -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
   -d      Enable debug logging to debug.log in the current directory
   -v      Print version and exit
   -h      Show this help
@@ -69,6 +70,7 @@ Basic workflow:
   5. For AAC: uses adaptive fdkaac quality based on high-frequency energy analysis.
      - Levels: -m 5 (no lowpass), -m 4 -w 17000 (lowpass at 17kHz), -m 4 (no explicit lowpass).
   6. After AAC encoding, repacks .m4a files with faststart to prevent iPod reboots.
+  7. Displays a summary report of SoX usage and AAC quality decisions.
 
 Dependencies: flac (metaflac), sox, fdkaac, lame (for MP3), ffmpeg, awk, bash 4+
 EOF
@@ -101,7 +103,7 @@ log_debug "Target format set to: $target"
 # --- Helper: choose fdkaac parameters based on high-frequency energy ---
 analyze_aac_params() {
     local flac_file="$1"
-    local r_ref r_mid r_high d_high d_mid params
+    local r_ref r_mid r_high params
 
     log_debug "Analyzing AAC quality for: $flac_file"
 
@@ -121,7 +123,7 @@ analyze_aac_params() {
              awk '/mean_volume/ {print $5}')
     log_debug "  >17k band mean volume: $r_high dB"
 
-    # Decision based on relative levels
+    # Decision based on relative levels, returns parameters string and optionally logs reason
     params=$(awk -v ref="$r_ref" -v mid="$r_mid" -v high="$r_high" '
     BEGIN {
         d_high = high - ref
@@ -136,11 +138,13 @@ analyze_aac_params() {
             print "-m 4"
             reason = "no useful energy above 15.5k"
         }
-    }' | tee >(cat >&3) 2>/dev/null)  # capture params and also log them
-
+    }')
     log_debug "  Decision: $params"
     echo "$params"
 }
+
+# --- Prepare summary array ---
+summary_lines=()
 
 # --- Main conversion loop ---
 for f in *.flac; do
@@ -156,12 +160,12 @@ for f in *.flac; do
     metaflac --export-picture-to=/tmp/cover.jpg "$f" 2>/dev/null || true
     log_debug "  Cover export attempted"
 
-    TITLE=$(metaflac --show-tag=TITLE "$f" 2>/dev/null | cut -d= -f2-) || true
-    ARTIST=$(metaflac --show-tag=ARTIST "$f" 2>/dev/null | cut -d= -f2-) || true
-    ALBUM=$(metaflac --show-tag=ALBUM "$f" 2>/dev/null | cut -d= -f2-) || true
-    TRACK=$(metaflac --show-tag=TRACKNUMBER "$f" 2>/dev/null | cut -d= -f2-) || true
-    DATE=$(metaflac --show-tag=DATE "$f" 2>/dev/null | cut -d= -f2-) || true
-    GENRE=$(metaflac --show-tag=GENRE "$f" 2>/dev/null | cut -d= -f2-) || true
+    TITLE=$(metaflac --show-tag=TITLE "$f" 2>/dev/null | cut -d= -f2- || true)
+    ARTIST=$(metaflac --show-tag=ARTIST "$f" 2>/dev/null | cut -d= -f2- || true)
+    ALBUM=$(metaflac --show-tag=ALBUM "$f" 2>/dev/null | cut -d= -f2- || true)
+    TRACK=$(metaflac --show-tag=TRACKNUMBER "$f" 2>/dev/null | cut -d= -f2- || true)
+    DATE=$(metaflac --show-tag=DATE "$f" 2>/dev/null | cut -d= -f2- || true)
+    GENRE=$(metaflac --show-tag=GENRE "$f" 2>/dev/null | cut -d= -f2- || true)
     log_debug "  Metadata extracted: title='$TITLE' artist='$ARTIST' album='$ALBUM' track='$TRACK' date='$DATE' genre='$GENRE'"
 
     SAMPLERATE=$(metaflac --show-sample-rate "$f")
@@ -170,31 +174,32 @@ for f in *.flac; do
 
     # --- Determine whether SoX is needed and set output sample rate ---
     need_sox=false
+    sox_detail="none"
     if [ "$target" = "aac" ]; then
-        # iPod natively supports 16-bit 44100 & 48000
         if [ "$BPS" -eq 16 ] && { [ "$SAMPLERATE" -eq 44100 ] || [ "$SAMPLERATE" -eq 48000 ]; }; then
             need_sox=false
             rate_out="$SAMPLERATE"
         else
             need_sox=true
-            rate_out=48000   # AAC target: down‑convert everything else to 16/48k
+            rate_out=48000
+            # Build SoX detail string: e.g., "24/96k -> 16/48k"
+            sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
         fi
     else  # mp3
-        # T‑Rex only likes 16-bit 44100
         if [ "$BPS" -eq 16 ] && [ "$SAMPLERATE" -eq 44100 ]; then
             need_sox=false
             rate_out=44100
         else
             need_sox=true
-            rate_out=44100   # MP3 target: always 16/44.1k
+            rate_out=44100
+            sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
         fi
     fi
-    log_debug "  Resampling needed: $need_sox, target rate: $rate_out Hz"
+    log_debug "  Resampling needed: $need_sox, target rate: $rate_out Hz, sox_detail: $sox_detail"
 
     # Build piped decode chain
     decode_pipe=( flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" )
 
-    # Insert SoX if needed
     if $need_sox; then
         decode_pipe+=( \|  sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw -  \
                             -b 16 -t raw - rate -h "$rate_out" )
@@ -214,12 +219,11 @@ for f in *.flac; do
     fi
 
     # --- Encoder specific part ---
+    aac_quality=""
     if [ "$target" = "aac" ]; then
-        # Analyse and get fdkaac quality parameters
         fdkaac_params=$(analyze_aac_params "$f")
-
-        log_debug "  Encoding to AAC with: $fdkaac_params"
-        # Run the pipeline and encode
+        aac_quality="$fdkaac_params"  # e.g., "-m 5" or "-m 4 -w 17000" or "-m 4"
+        log_debug "  Encoding to AAC with: $aac_quality"
         eval "${decode_pipe[@]}" | \
             fdkaac \
                 -p 2 \
@@ -238,13 +242,11 @@ for f in *.flac; do
                 "${COVER_ARGS[@]}" \
                 -o "${f%.flac}.m4a" -
     else
-        # MP3: always VBR quality 4
-        srate_lame=$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")
-        log_debug "  Encoding to MP3 (LAME -V 4 @ ${srate_lame}kHz)"
+        log_debug "  Encoding to MP3 (LAME -V 4 @ $(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")kHz)"
         eval "${decode_pipe[@]}" | \
             lame \
                 -r \
-                -s "$srate_lame" \
+                -s "$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")" \
                 --bitwidth 16 \
                 --signed \
                 --little-endian \
@@ -258,6 +260,16 @@ for f in *.flac; do
                 "${COVER_ARGS[@]}" \
                 - "${f%.flac}.mp3"
     fi
+
+    # Build summary line for this file
+    line="$f : SoX: $sox_detail"
+    if [ "$target" = "aac" ]; then
+        line+=" ; AAC: $aac_quality"
+    else
+        line+=" ; MP3: VBR V4"
+    fi
+    summary_lines+=("$line")
+    log_debug "  Summary: $line"
 
     rm -f /tmp/cover.jpg
     log_debug "  Conversion completed for $f"
@@ -274,6 +286,12 @@ if [ "$target" = "aac" ]; then
     done
     log_debug "Repacking finished."
 fi
+
+# --- Final summary report ---
+echo ""
+echo "========== Conversion Summary =========="
+printf '%s\n' "${summary_lines[@]}"
+echo "========================================"
 
 log_debug "All conversions completed."
 echo "All conversions completed."
