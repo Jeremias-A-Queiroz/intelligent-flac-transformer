@@ -9,3 +9,6 @@
           decisions
 - 0.3.1 - removed eval pipeline (spaces in filenames), individual cover temp files,
           dependency fail-fast check
+- 0.4.0 - replaced fdkaac tag injection with AtomicParsley for iPod container compatibility;
+          added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
+          entirely; kept all audio analysis and SoX logic intact.
