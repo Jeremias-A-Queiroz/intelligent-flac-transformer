@@ -1,3 +1,12 @@
+# [0.4.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.3.1...v0.4.0) (2026-08-12)
+
+
+### Features
+
+* Improve music tag logic ([db4cec5](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/db4cec5302b94181f5e45b55375353b32cdb6337))
+
+
+
 ## [0.3.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.3.0...v0.3.1) (2026-08-12)
 
 
