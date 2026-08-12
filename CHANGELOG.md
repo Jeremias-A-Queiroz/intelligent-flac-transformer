@@ -1,3 +1,12 @@
+## [0.3.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.3.0...v0.3.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* coding fixes ([5ea03d6](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/5ea03d65eda62931070be350d960bab8b6b9b065))
+
+
+
 # [0.3.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.2.0...v0.3.0) (2026-08-12)
 
 
