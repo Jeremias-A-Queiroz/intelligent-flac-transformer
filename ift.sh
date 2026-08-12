@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ift.sh — Intelligent FLAC transcoder for iPod (AAC) or T-Rex 3 (MP3)
-# Copyright (C) 2025  <your name/email>
+# Copyright (C) 2025  jeremias@infralinux.com.br
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,6 +23,9 @@
 # 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
 # 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files,
 #         dependency fail-fast check
+# 0.3.0 - replaced fdkaac tag injection with AtomicParsley for iPod container compatibility;
+#         added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
+#         entirely; kept all audio analysis and SoX logic intact.
 
 set -euo pipefail
 
@@ -46,14 +49,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.2.2"
+    echo "ift.sh version 0.3.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.2.2
+Version 0.3.0
 
 Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
@@ -66,22 +69,23 @@ No format flag: interactive prompt.
 
 Basic workflow:
   1. Scans all FLAC files in the current directory.
-  2. Checks for required tools (flac, sox, fdkaac, lame, ffmpeg, awk).
+  2. Checks for required tools (flac, sox, fdkaac, lame, ffmpeg, awk, AtomicParsley).
   3. Extracts metadata (title, artist, album, track, date, genre, cover).
   4. Determines if SoX resampling is needed based on target and source bit-depth/sample rate.
   5. For MP3: always converts to 16-bit 44.1kHz; encodes with LAME -V 4.
   6. For AAC: uses adaptive fdkaac quality based on high-frequency energy analysis.
      - Levels: -m 5 (no lowpass), -m 4 -w 17000 (lowpass at 17kHz), -m 4 (no explicit lowpass).
-  7. After AAC encoding, repacks .m4a files with faststart to prevent iPod reboots.
-  8. Displays a summary report of SoX usage and AAC quality decisions.
+  7. Optimizes cover art to 200x200 baseline JPEG to prevent iPod reboots.
+  8. Injects all metadata and cover art via AtomicParsley for perfect iPod container compatibility.
+  9. Displays a summary report of SoX usage and AAC quality decisions.
 
-Dependencies: flac (metaflac), sox, fdkaac, lame (for MP3), ffmpeg, awk, bash 4+
+Dependencies: flac (metaflac), sox, fdkaac, lame (for MP3), ffmpeg, awk, AtomicParsley, bash 4+
 EOF
     exit 0
 fi
 
 # --- Dependency Check (Fail-Fast) ---
-for cmd in flac sox fdkaac lame ffmpeg awk; do
+for cmd in flac sox fdkaac lame ffmpeg awk AtomicParsley; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Error: Required dependency '$cmd' not found in PATH." >&2
         exit 1
@@ -160,14 +164,24 @@ for f in *.flac; do
 
     log_debug "--- Processing: $f ---"
 
-    # Individual cover temp file
-    cover_file="/tmp/cover_$(basename "$f" .flac).jpg"
-    rm -f "$cover_file"
-    log_debug "  Cover temp file: $cover_file"
+    # Individual cover temp files
+    cover_raw="/tmp/cover_raw_$(basename "$f" .flac).jpg"
+    cover_opt="/tmp/cover_opt_$(basename "$f" .flac).jpg"
+    rm -f "$cover_raw" "$cover_opt"
+    log_debug "  Cover temp files: raw=$cover_raw, optimized=$cover_opt"
 
     # Extract cover
-    metaflac --export-picture-to="$cover_file" "$f" 2>/dev/null || true
+    metaflac --export-picture-to="$cover_raw" "$f" 2>/dev/null || true
     log_debug "  Cover export attempted"
+
+    # --- Sanitize cover art for iPod (200x200 baseline JPEG) ---
+    if [ -f "$cover_raw" ]; then
+        ffmpeg -y -i "$cover_raw" -vf "scale='min(200,iw)':'min(200,ih)'" \
+            -pix_fmt yuvj420p -frames:v 1 -q:v 5 "$cover_opt" 2>/dev/null
+        log_debug "  Cover sanitized to 200x200 baseline JPEG"
+    else
+        log_debug "  No cover found, skip sanitization"
+    fi
 
     TITLE=$(metaflac --show-tag=TITLE "$f" 2>/dev/null | cut -d= -f2- || true)
     ARTIST=$(metaflac --show-tag=ARTIST "$f" 2>/dev/null | cut -d= -f2- || true)
@@ -205,26 +219,15 @@ for f in *.flac; do
     fi
     log_debug "  Resampling needed: $need_sox, target rate: $rate_out Hz, sox_detail: $sox_detail"
 
-    # Build encoder cover argument
-    COVER_ARGS=()
-    if [ -f "$cover_file" ]; then
-        if [ "$target" = "aac" ]; then
-            COVER_ARGS=(--tag-from-file "covr:$cover_file")
-        else
-            COVER_ARGS=(--ti "$cover_file")
-        fi
-        log_debug "  Cover will be embedded"
-    else
-        log_debug "  No cover found"
-    fi
-
     # --- Encode ---
     aac_quality=""
     if [ "$target" = "aac" ]; then
         fdkaac_params=$(analyze_aac_params "$f")
         aac_quality="$fdkaac_params"
-        log_debug "  Encoding to AAC with: $aac_quality"
+        log_debug "  Encoding to AAC (fdkaac) with: $aac_quality"
 
+        # Generate raw AAC audio (naked, no tags, no moov-before-mdat)
+        tmp_naked="tmp_naked_$(basename "$f" .flac).m4a"
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
                 sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
@@ -236,15 +239,7 @@ for f in *.flac; do
                     --raw-channels 2 \
                     --raw-rate "$rate_out" \
                     --raw-format s16L \
-                    --moov-before-mdat \
-                    --title "$TITLE" \
-                    --artist "$ARTIST" \
-                    --album "$ALBUM" \
-                    --track "$TRACK" \
-                    --date "$DATE" \
-                    --genre "$GENRE" \
-                    "${COVER_ARGS[@]}" \
-                    -o "${f%.flac}.m4a" -
+                    -o "$tmp_naked" -
         else
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
                 fdkaac \
@@ -254,20 +249,40 @@ for f in *.flac; do
                     --raw-channels 2 \
                     --raw-rate "$rate_out" \
                     --raw-format s16L \
-                    --moov-before-mdat \
-                    --title "$TITLE" \
-                    --artist "$ARTIST" \
-                    --album "$ALBUM" \
-                    --track "$TRACK" \
-                    --date "$DATE" \
-                    --genre "$GENRE" \
-                    "${COVER_ARGS[@]}" \
-                    -o "${f%.flac}.m4a" -
+                    -o "$tmp_naked" -
         fi
+
+        # Inject metadata and sanitized cover with AtomicParsley
+        cov_flag=()
+        if [ -f "$cover_opt" ]; then
+            cov_flag=(--artwork "$cover_opt")
+        fi
+
+        AtomicParsley "$tmp_naked" \
+            --title "$TITLE" \
+            --artist "$ARTIST" \
+            --album "$ALBUM" \
+            --tracknum "$TRACK" \
+            --year "$DATE" \
+            --genre "$GENRE" \
+            "${cov_flag[@]}" \
+            --overWrite \
+            >/dev/null 2>&1
+
+        # Rename to final .m4a
+        mv -f "$tmp_naked" "${f%.flac}.m4a"
+        log_debug "  AAC encoding and tagging completed via fdkaac + AtomicParsley"
+
     else  # mp3
         srate_lame=$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")
         log_debug "  Encoding to MP3 (LAME -V 4 @ ${srate_lame}kHz)"
 
+        # Build cover args for LAME (use raw or optimized cover for consistency)
+        COVER_ARGS=()
+        if [ -f "$cover_raw" ]; then
+            COVER_ARGS=(--ti "$cover_raw")
+        fi
+
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
                 sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
@@ -305,6 +320,7 @@ for f in *.flac; do
                     "${COVER_ARGS[@]}" \
                     - "${f%.flac}.mp3"
         fi
+        log_debug "  MP3 encoding completed via LAME"
     fi
 
     # Build summary line
@@ -317,25 +333,13 @@ for f in *.flac; do
     summary_lines+=("$line")
     log_debug "  Summary: $line"
 
-    # Clean up individual cover file
-    rm -f "$cover_file"
+    # Clean up individual cover files
+    rm -f "$cover_raw" "$cover_opt"
     log_debug "  Conversion completed for $f"
 done
 
 # --- Final cleanup of any leftover cover temp files ---
-rm -f /tmp/cover_*.jpg
-
-# --- AAC post‑processing: repack with fast‑start to prevent iPod reboots ---
-if [ "$target" = "aac" ]; then
-    log_debug "Repacking .m4a files for iPod compatibility..."
-    mkdir -p repacked
-    for m4a in *.m4a; do
-        [ -e "$m4a" ] || continue
-        log_debug "  Repacking $m4a"
-        ffmpeg -y -i "$m4a" -c copy -movflags +faststart "repacked/$m4a"
-    done
-    log_debug "Repacking finished."
-fi
+rm -f /tmp/cover_raw_*.jpg /tmp/cover_opt_*.jpg
 
 # --- Final summary report ---
 echo ""
