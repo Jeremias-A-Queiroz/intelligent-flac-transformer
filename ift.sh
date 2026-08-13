@@ -14,7 +14,8 @@
 # 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
 # 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files
 # 0.3.0 - replaced fdkaac tag injection with AtomicParsley; added cover art sanitization
-# 0.4.0 - added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
+# 0.4.0 - replaced fdkaac tag injection with AtomicParsley for iPod container compatibility;
+#         added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
 #         entirely; kept all audio analysis and SoX logic intact.
 # 0.5.0 - feat: implement interactive pre-flight metadata validation
 #         refactor: decouple tag extraction from audio processing loop
@@ -25,6 +26,7 @@
 #         feat: add processing strategy summary and confirmation prompt
 #         refactor: worker phase now relies entirely on pre-calculated arrays
 #         style: update interactive prompts to formal English
+
 
 set -euo pipefail
 
