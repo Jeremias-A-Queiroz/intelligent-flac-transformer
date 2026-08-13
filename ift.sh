@@ -14,11 +14,17 @@
 # 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
 # 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files
 # 0.3.0 - replaced fdkaac tag injection with AtomicParsley; added cover art sanitization
+# 0.4.0 - added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
+#         entirely; kept all audio analysis and SoX logic intact.
 # 0.5.0 - feat: implement interactive pre-flight metadata validation
 #         refactor: decouple tag extraction from audio processing loop
 #         perf: process cover art sanitization only once per album
 #         feat: add support for multi-disc and total tracks tags
 #         fix: bash arithmetic evaluation triggering set -e on track count
+# 0.6.0 - feat: extract audio analysis to a pre-flight phase
+#         feat: add processing strategy summary and confirmation prompt
+#         refactor: worker phase now relies entirely on pre-calculated arrays
+#         style: update interactive prompts to formal English
 
 set -euo pipefail
 
@@ -42,6 +48,13 @@ TOTAL_TRACKS=0
 FILE_PATHS=()
 TRACK_TITLES=()
 TRACK_NUMS=()
+
+# Arrays for audio analysis strategy
+TRACK_BPS=()
+TRACK_SRATE=()
+TRACK_NEEDS_SOX=()
+TRACK_OUT_SRATE=()
+TRACK_AAC_PARAMS=()
 summary_lines=()
 
 # Temp files
@@ -62,14 +75,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.5.0"
+    echo "ift.sh version 0.6.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.5.0
+Version 0.6.0
 
 Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
@@ -108,7 +121,7 @@ trap cleanup EXIT
 
 # --- Target Format Prompt ---
 if [ -z "$target" ]; then
-    read -r -p "Please select the output format (aac/mp3): " target
+    read -r -p "Please select the desired output format (aac/mp3): " target
     if [ "$target" != "aac" ] && [ "$target" != "mp3" ]; then
         echo "Error: Invalid format '$target'. Please choose 'aac' or 'mp3'." >&2
         exit 1
@@ -137,15 +150,13 @@ analyze_aac_params() {
 }
 
 # =============================================================================
-# PHASE 1: PRE-FLIGHT SCAN & VALIDATION
+# PHASE 1: PRE-FLIGHT SCAN & METADATA VALIDATION
 # =============================================================================
 log_debug "Starting Pre-flight scan..."
 
-# Glob files
 for f in *.flac; do
     [ -e "$f" ] || continue
     FILE_PATHS+=("$f")
-    # Fix: avoid post-increment returning 0 and triggering set -e
     TOTAL_TRACKS=$((TOTAL_TRACKS + 1))
 done
 
@@ -154,7 +165,6 @@ if [ "$TOTAL_TRACKS" -eq 0 ]; then
     exit 0
 fi
 
-# Extract initial metadata to arrays and check consistency
 for i in "${!FILE_PATHS[@]}"; do
     f="${FILE_PATHS[$i]}"
     
@@ -168,14 +178,12 @@ for i in "${!FILE_PATHS[@]}"; do
     TRACK_TITLES+=("$t_title")
     TRACK_NUMS+=("$t_num")
 
-    # Consistency check for album globals
     if [ "$i" -eq 0 ]; then
         ALBUM_TITLE="$t_album"
         ALBUM_ARTIST="$t_artist"
         ALBUM_GENRE="$t_genre"
         ALBUM_YEAR="$t_year"
         
-        # Try to extract embedded cover from the first track
         if metaflac --export-picture-to="$TMP_EXTRACTED_COVER" "$f" 2>/dev/null; then
             ALBUM_COVER="$TMP_EXTRACTED_COVER"
         fi
@@ -187,19 +195,16 @@ for i in "${!FILE_PATHS[@]}"; do
     fi
 done
 
-# Interactive Validation Loop
 while true; do
     clear
     echo "=== Metadata Validation ==="
     
-    # Prompt for Album globals
     read -r -p "Album Title [$ALBUM_TITLE]: " input; [ -n "$input" ] && ALBUM_TITLE="$input"
     read -r -p "Album Artist [$ALBUM_ARTIST]: " input; [ -n "$input" ] && ALBUM_ARTIST="$input"
     read -r -p "Genre [$ALBUM_GENRE]: " input; [ -n "$input" ] && ALBUM_GENRE="$input"
     read -r -p "Release Year [$ALBUM_YEAR]: " input; [ -n "$input" ] && ALBUM_YEAR="$input"
 
-    # Multi-disc prompt
-    read -r -p "Is this a multi-disc release? (y/n) [n]: " is_multidisc
+    read -r -p "Does this release consist of multiple discs? (y/n) [n]: " is_multidisc
     if [[ "$is_multidisc" =~ ^[Yy]$ ]]; then
         read -r -p "Current Disc Number [$DISC_NUM]: " input; [ -n "$input" ] && DISC_NUM="$input"
         read -r -p "Total Number of Discs [$TOTAL_DISCS]: " input; [ -n "$input" ] && TOTAL_DISCS="$input"
@@ -208,11 +213,10 @@ while true; do
         TOTAL_DISCS="1"
     fi
 
-    # Cover Art prompt
     if [ -z "$ALBUM_COVER" ] || [ ! -f "$ALBUM_COVER" ]; then
         if [ -f "cover.jpg" ] || [ -f "cover.png" ]; then
             local_cov=$(ls cover.* | head -n 1)
-            read -r -p "Local '$local_cov' found. Use as album cover? (y/n) [y]: " use_local
+            read -r -p "Local file '$local_cov' detected. Use this as the album cover? (y/n) [y]: " use_local
             if [[ -z "$use_local" || "$use_local" =~ ^[Yy]$ ]]; then
                 ALBUM_COVER="$local_cov"
             fi
@@ -220,24 +224,22 @@ while true; do
     fi
     
     if [ -z "$ALBUM_COVER" ] || [ ! -f "$ALBUM_COVER" ]; then
-        read -r -p "Provide path to cover image (leave blank to skip): " input
+        read -r -p "Please provide the path to the cover image (leave blank to skip): " input
         [ -n "$input" ] && ALBUM_COVER="$input"
     fi
 
-    # Track-level validation
     echo -e "\n--- Validating Tracks ---"
     for i in "${!FILE_PATHS[@]}"; do
         if [ -z "${TRACK_TITLES[$i]}" ]; then
-            read -r -p "Missing Title for '${FILE_PATHS[$i]}'. Enter title: " input
+            read -r -p "Title missing for '${FILE_PATHS[$i]}'. Please enter the title: " input
             TRACK_TITLES[$i]="$input"
         fi
         if [ -z "${TRACK_NUMS[$i]}" ]; then
-            read -r -p "Missing Track Number for '${FILE_PATHS[$i]}'. Enter number: " input
+            read -r -p "Track number missing for '${FILE_PATHS[$i]}'. Please enter the track number: " input
             TRACK_NUMS[$i]="$input"
         fi
     done
 
-    # Display Summary Form
     clear
     echo "========================================"
     echo "          ALBUM METADATA SUMMARY        "
@@ -257,64 +259,115 @@ while true; do
     read -r -p "Are the provided details correct? (y - Proceed / n - Edit / c - Cancel): " confirm
     case "$confirm" in
         [Yy]*) break ;;
-        [Cc]*) echo "Operation cancelled by user."; exit 0 ;;
+        [Cc]*) echo "Operation cancelled by the user."; exit 0 ;;
         *) echo "Restarting validation..." ;;
     esac
 done
 
 # =============================================================================
-# PHASE 2: WORKER (PROCESSING)
+# PHASE 2: AUDIO PRE-ANALYSIS & STRATEGY
+# =============================================================================
+log_debug "Starting Audio Pre-analysis Phase..."
+echo "Analyzing audio streams. Please wait..."
+
+for i in "${!FILE_PATHS[@]}"; do
+    f="${FILE_PATHS[$i]}"
+    
+    srate=$(metaflac --show-sample-rate "$f")
+    bps=$(metaflac --show-bps "$f")
+    
+    TRACK_SRATE+=("$srate")
+    TRACK_BPS+=("$bps")
+    
+    need_sox=false
+    rate_out=44100
+    aac_params=""
+
+    if [ "$target" = "aac" ]; then
+        if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+            rate_out="$srate"
+        else
+            need_sox=true
+            rate_out=48000
+        fi
+        aac_params=$(analyze_aac_params "$f")
+    else
+        if [ "$bps" -eq 16 ] && [ "$srate" -eq 44100 ]; then
+            rate_out=44100
+        else
+            need_sox=true
+            rate_out=44100
+        fi
+    fi
+
+    TRACK_NEEDS_SOX+=("$need_sox")
+    TRACK_OUT_SRATE+=("$rate_out")
+    TRACK_AAC_PARAMS+=("$aac_params")
+done
+
+# Display Processing Strategy Summary
+clear
+echo "========================================"
+echo "      PROCESSING STRATEGY SUMMARY       "
+echo "========================================"
+
+for i in "${!FILE_PATHS[@]}"; do
+    srate_in_fmt=$(awk "BEGIN {print ${TRACK_SRATE[$i]}/1000 \"k\"}")
+    srate_out_fmt=$(awk "BEGIN {print ${TRACK_OUT_SRATE[$i]}/1000 \"k\"}")
+    bps_in="${TRACK_BPS[$i]}"
+    
+    if ${TRACK_NEEDS_SOX[$i]}; then
+        sox_str="SoX: ${bps_in}/${srate_in_fmt} -> 16/${srate_out_fmt}"
+    else
+        sox_str="Audio: ${bps_in}/${srate_in_fmt} (Unchanged)"
+    fi
+    
+    if [ "$target" = "aac" ]; then
+        enc_str="FDKAAC: ${TRACK_AAC_PARAMS[$i]}"
+    else
+        enc_str="LAME: VBR V4"
+    fi
+    
+    printf "%02d - %s\n    [ %s ] [ %s ]\n" "${TRACK_NUMS[$i]}" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
+    
+    # Store for final summary
+    summary_lines+=("${FILE_PATHS[$i]} : $sox_str ; $enc_str")
+done
+echo "========================================"
+
+read -r -p "Do you wish to proceed with this processing strategy? (y - Proceed / c - Cancel): " confirm_strat
+case "$confirm_strat" in
+    [Yy]*) echo "Starting conversion..." ;;
+    *) echo "Operation cancelled by the user."; exit 0 ;;
+esac
+
+# =============================================================================
+# PHASE 3: WORKER (PROCESSING)
 # =============================================================================
 log_debug "Starting Worker Phase..."
 
-# Optimize cover art ONCE for the entire album
 if [ -n "$ALBUM_COVER" ] && [ -f "$ALBUM_COVER" ]; then
     log_debug "Optimizing cover art: $ALBUM_COVER"
     ffmpeg -y -i "$ALBUM_COVER" -vf "scale='min(200,iw)':'min(200,ih)'" \
         -pix_fmt yuvj420p -frames:v 1 -q:v 5 "$TMP_OPT_COVER" 2>/dev/null || true
-else
-    log_debug "No valid cover art provided. Skipping cover optimization."
 fi
 
-# Main processing loop using array indices
 for i in "${!FILE_PATHS[@]}"; do
     f="${FILE_PATHS[$i]}"
     log_debug "--- Processing: $f ---"
 
-    SAMPLERATE=$(metaflac --show-sample-rate "$f")
-    BPS=$(metaflac --show-bps "$f")
-    
-    # Determine SoX usage
-    need_sox=false
-    sox_detail="none"
-    if [ "$target" = "aac" ]; then
-        if [ "$BPS" -eq 16 ] && { [ "$SAMPLERATE" -eq 44100 ] || [ "$SAMPLERATE" -eq 48000 ]; }; then
-            rate_out="$SAMPLERATE"
-        else
-            need_sox=true
-            rate_out=48000
-            sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
-        fi
-    else
-        if [ "$BPS" -eq 16 ] && [ "$SAMPLERATE" -eq 44100 ]; then
-            rate_out=44100
-        else
-            need_sox=true
-            rate_out=44100
-            sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
-        fi
-    fi
+    need_sox="${TRACK_NEEDS_SOX[$i]}"
+    rate_out="${TRACK_OUT_SRATE[$i]}"
+    srate="${TRACK_SRATE[$i]}"
+    bps="${TRACK_BPS[$i]}"
 
-    # Encode and Tag
-    aac_quality=""
     if [ "$target" = "aac" ]; then
-        fdkaac_params=$(analyze_aac_params "$f")
-        aac_quality="$fdkaac_params"
+        fdkaac_params="${TRACK_AAC_PARAMS[$i]}"
         tmp_naked="/tmp/tmp_naked_$(basename "$f" .flac).m4a"
 
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
+                sox -G -r "$srate" -c 2 -b "$bps" -e signed-integer -t raw - \
                     -b 16 -t raw - rate -h "$rate_out" | \
                 fdkaac -p 2 $fdkaac_params --raw --raw-channels 2 --raw-rate "$rate_out" --raw-format s16L -o "$tmp_naked" -
         else
@@ -340,13 +393,12 @@ for i in "${!FILE_PATHS[@]}"; do
 
     else
         srate_lame=$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")
-        
         COVER_ARGS=()
         [ -f "$TMP_OPT_COVER" ] && COVER_ARGS=(--ti "$TMP_OPT_COVER")
 
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
+                sox -G -r "$srate" -c 2 -b "$bps" -e signed-integer -t raw - \
                     -b 16 -t raw - rate -h "$rate_out" | \
                 lame -r -s "$srate_lame" --bitwidth 16 --signed --little-endian -V 4 \
                     --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
@@ -360,11 +412,6 @@ for i in "${!FILE_PATHS[@]}"; do
                     --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" - "${f%.flac}.mp3"
         fi
     fi
-
-    # Build summary
-    line="$f : SoX: $sox_detail"
-    [ "$target" = "aac" ] && line+=" ; AAC: $aac_quality" || line+=" ; MP3: VBR V4"
-    summary_lines+=("$line")
 done
 
 # --- Final summary report ---
