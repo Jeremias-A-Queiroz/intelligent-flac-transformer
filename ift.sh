@@ -28,6 +28,8 @@
 #         style: update interactive prompts to formal English
 # 0.7.0 - refactor: replace raw audio pipes with intermediate WAV files to fix AAC frame truncation and iPod reboots
 #         style: improve final summary report layout to match processing strategy
+# 0.8.0 - feat: add support for Nero AAC (neroAacEnc/neroAacTag)
+#         refactor: move dependency check after target selection to allow dynamic tool requirements
 
 
 set -euo pipefail
@@ -70,6 +72,7 @@ TMP_OPT_COVER="$TMP_DIR/opt_cover.jpg"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -aac) target="aac" ;;
+        -nero) target="nero" ;;
         -mp3) target="mp3" ;;
         -d)   debug=true ;;
         -v)   show_version=true ;;
@@ -80,18 +83,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.7.0"
+    echo "ift.sh version 0.8.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.7.0
+Version 0.8.0
 
-Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
-  -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
+Usage: $0 [-aac|-nero|-mp3] [-d] [-v] [-h]
   -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
+  -nero   Directly transcode to AAC using Nero encoder (neroAacEnc, adaptive quality)
+  -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
   -d      Enable debug logging to debug.log in the current directory
   -v      Print version and exit
   -h      Show this help
@@ -100,14 +104,6 @@ No format flag: interactive prompt.
 EOF
     exit 0
 fi
-
-# --- Dependency Check ---
-for cmd in flac sox fdkaac lame ffmpeg awk AtomicParsley; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "Error: Required dependency '$cmd' not found in PATH." >&2
-        exit 1
-    fi
-done
 
 # --- Setup debug logging & Traps ---
 if $debug; then
@@ -127,15 +123,30 @@ trap cleanup EXIT
 
 # --- Target Format Prompt ---
 if [ -z "$target" ]; then
-    read -r -p "Please select the desired output format (aac/mp3): " target
-    if [ "$target" != "aac" ] && [ "$target" != "mp3" ]; then
-        echo "Error: Invalid format '$target'. Please choose 'aac' or 'mp3'." >&2
+    read -r -p "Please select the desired output format (aac/nero/mp3): " target
+    if [ "$target" != "aac" ] && [ "$target" != "nero" ] && [ "$target" != "mp3" ]; then
+        echo "Error: Invalid format '$target'. Please choose 'aac', 'nero', or 'mp3'." >&2
         exit 1
     fi
 fi
 log_debug "Target format set to: $target"
 
-# --- Helper: AAC Analysis ---
+# --- Dynamic dependency check ---
+deps=(flac sox ffmpeg awk)
+case "$target" in
+    aac)  deps+=(fdkaac AtomicParsley) ;;
+    nero) deps+=(neroAacEnc neroAacTag) ;;
+    mp3)  deps+=(lame) ;;
+esac
+
+for cmd in "${deps[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: Required dependency '$cmd' not found in PATH." >&2
+        exit 1
+    fi
+done
+
+# --- Helper: AAC Analysis (FDK) ---
 analyze_aac_params() {
     local flac_file="$1"
     local r_ref r_mid r_high params
@@ -151,6 +162,26 @@ analyze_aac_params() {
         if (d_high >= -31.0) print "-m 5"
         else if (d_mid >= -31.0) print "-m 4 -w 17000"
         else print "-m 4"
+    }')
+    echo "$params"
+}
+
+# --- Helper: Nero AAC Analysis ---
+analyze_nero_params() {
+    local flac_file="$1"
+    local r_ref r_mid r_high params
+
+    r_ref=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+    r_mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+    r_high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+
+    params=$(awk -v ref="$r_ref" -v mid="$r_mid" -v high="$r_high" '
+    BEGIN {
+        d_high = high - ref
+        d_mid  = mid - ref
+        if (d_high >= -31.0) print "-q 0.55"
+        else if (d_mid >= -31.0) print "-q 0.50"
+        else print "-q 0.45"
     }')
     echo "$params"
 }
@@ -297,6 +328,14 @@ for i in "${!FILE_PATHS[@]}"; do
             rate_out=48000
         fi
         aac_params=$(analyze_aac_params "$f")
+    elif [ "$target" = "nero" ]; then
+        if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+            rate_out="$srate"
+        else
+            need_sox=true
+            rate_out=48000
+        fi
+        aac_params=$(analyze_nero_params "$f")
     else
         if [ "$bps" -eq 16 ] && [ "$srate" -eq 44100 ]; then
             rate_out=44100
@@ -330,6 +369,8 @@ for i in "${!FILE_PATHS[@]}"; do
     
     if [ "$target" = "aac" ]; then
         enc_str="FDKAAC: ${TRACK_AAC_PARAMS[$i]}"
+    elif [ "$target" = "nero" ]; then
+        enc_str="Nero AAC: ${TRACK_AAC_PARAMS[$i]}"
     else
         enc_str="LAME: VBR V4"
     fi
@@ -397,6 +438,42 @@ for i in "${!FILE_PATHS[@]}"; do
             --genre "$ALBUM_GENRE" \
             "${cov_flag[@]}" \
             --overWrite >/dev/null 2>&1
+
+        mv -f "$tmp_naked" "${f%.flac}.m4a"
+
+    elif [ "$target" = "nero" ]; then
+        nero_q="${TRACK_AAC_PARAMS[$i]}"
+        tmp_naked="$TMP_DIR/tmp_naked_$(basename "$f" .flac).m4a"
+
+        if $need_sox; then
+            log_debug "Decoding and resampling $f to temporary WAV via SoX"
+            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
+        else
+            log_debug "Decoding $f directly to temporary WAV"
+            flac -s -f -d "$f" -o "$tmp_wav"
+        fi
+
+        log_debug "Encoding WAV to AAC with Nero: neroAacEnc $nero_q"
+        neroAacEnc -q "$nero_q" -if "$tmp_wav" -of "$tmp_naked"
+
+        log_debug "Injecting metadata via neroAacTag"
+        neroAacTag "$tmp_naked" \
+            -meta:title="${TRACK_TITLES[$i]}" \
+            -meta:artist="$ALBUM_ARTIST" \
+            -meta:"album artist"="$ALBUM_ARTIST" \
+            -meta:album="$ALBUM_TITLE" \
+            -meta:year="$ALBUM_YEAR" \
+            -meta:genre="$ALBUM_GENRE" \
+            -meta:track="${TRACK_NUMS[$i]}" \
+            -meta:totaltracks="$TOTAL_TRACKS" \
+            -meta:disc="$DISC_NUM" \
+            -meta:totaldiscs="$TOTAL_DISCS" \
+            >/dev/null 2>&1
+
+        if [ -f "$TMP_OPT_COVER" ]; then
+            log_debug "Adding cover art via neroAacTag"
+            neroAacTag "$tmp_naked" -add-cover:front:"$TMP_OPT_COVER" >/dev/null 2>&1
+        fi
 
         mv -f "$tmp_naked" "${f%.flac}.m4a"
 
