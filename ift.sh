@@ -7,33 +7,46 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Version history
 # 0.1.0 - initial version (not numbered)
-# 0.2.0 - added debug flag (-d), direct format flags (-mp3, -aac), version (-v) and help (-h),
-#         error handling with clear guidance for debugging
+# 0.2.0 - added debug flag (-d), direct format flags (-mp3, -aac), version (-v) and help (-h)
 # 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
-# 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files,
-#         dependency fail-fast check
-# 0.3.0 - replaced fdkaac tag injection with AtomicParsley for iPod container compatibility;
-#         added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
-#         entirely; kept all audio analysis and SoX logic intact.
+# 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files
+# 0.3.0 - replaced fdkaac tag injection with AtomicParsley; added cover art sanitization
+# 0.5.0 - feat: implement interactive pre-flight metadata validation
+#         refactor: decouple tag extraction from audio processing loop
+#         perf: process cover art sanitization only once per album
+#         feat: add support for multi-disc and total tracks tags
+#         fix: bash arithmetic evaluation triggering set -e on track count
 
 set -euo pipefail
 
-# Global flags
+# Global flags & variables
 debug=false
 target=""
 show_version=false
 show_help=false
+
+# Metadata globals
+ALBUM_TITLE=""
+ALBUM_ARTIST=""
+ALBUM_GENRE=""
+ALBUM_YEAR=""
+ALBUM_COVER=""
+DISC_NUM="1"
+TOTAL_DISCS="1"
+TOTAL_TRACKS=0
+
+# Arrays for track-specific data
+FILE_PATHS=()
+TRACK_TITLES=()
+TRACK_NUMS=()
+summary_lines=()
+
+# Temp files
+TMP_EXTRACTED_COVER="/tmp/ift_extracted_cover_$$.jpg"
+TMP_OPT_COVER="/tmp/ift_opt_cover_$$.jpg"
 
 # --- Parse command-line options ---
 while [[ $# -gt 0 ]]; do
@@ -49,14 +62,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.3.0"
+    echo "ift.sh version 0.5.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.3.0
+Version 0.5.0
 
 Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
@@ -66,25 +79,11 @@ Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -h      Show this help
 
 No format flag: interactive prompt.
-
-Basic workflow:
-  1. Scans all FLAC files in the current directory.
-  2. Checks for required tools (flac, sox, fdkaac, lame, ffmpeg, awk, AtomicParsley).
-  3. Extracts metadata (title, artist, album, track, date, genre, cover).
-  4. Determines if SoX resampling is needed based on target and source bit-depth/sample rate.
-  5. For MP3: always converts to 16-bit 44.1kHz; encodes with LAME -V 4.
-  6. For AAC: uses adaptive fdkaac quality based on high-frequency energy analysis.
-     - Levels: -m 5 (no lowpass), -m 4 -w 17000 (lowpass at 17kHz), -m 4 (no explicit lowpass).
-  7. Optimizes cover art to 200x200 baseline JPEG to prevent iPod reboots.
-  8. Injects all metadata and cover art via AtomicParsley for perfect iPod container compatibility.
-  9. Displays a summary report of SoX usage and AAC quality decisions.
-
-Dependencies: flac (metaflac), sox, fdkaac, lame (for MP3), ffmpeg, awk, AtomicParsley, bash 4+
 EOF
     exit 0
 fi
 
-# --- Dependency Check (Fail-Fast) ---
+# --- Dependency Check ---
 for cmd in flac sox fdkaac lame ffmpeg awk AtomicParsley; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Error: Required dependency '$cmd' not found in PATH." >&2
@@ -92,7 +91,7 @@ for cmd in flac sox fdkaac lame ffmpeg awk AtomicParsley; do
     fi
 done
 
-# --- Setup debug logging ---
+# --- Setup debug logging & Traps ---
 if $debug; then
     exec 3>> debug.log
     log_debug() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >&3; }
@@ -101,115 +100,203 @@ else
     log_debug() { :; }
 fi
 
-# --- Error trap ---
-trap 'log_debug "ERROR occurred (exit code $?). Aborting."; echo "Error occurred. Re-run with -d for debug log or with bash -x for low-level trace." >&2; exit 1' ERR
+cleanup() {
+    rm -f "$TMP_EXTRACTED_COVER" "$TMP_OPT_COVER" /tmp/tmp_naked_*.m4a
+}
+trap 'log_debug "ERROR occurred (exit code $?). Aborting."; cleanup; echo "Error occurred. Re-run with -d for debug log." >&2; exit 1' ERR
+trap cleanup EXIT
 
-# --- Interactive prompt if no format flag given ---
+# --- Target Format Prompt ---
 if [ -z "$target" ]; then
-    read -r -p "Output format (aac/mp3)? " target
+    read -r -p "Please select the output format (aac/mp3): " target
     if [ "$target" != "aac" ] && [ "$target" != "mp3" ]; then
-        echo "Error: unknown type '$target', please choose 'aac' or 'mp3'" >&2
+        echo "Error: Invalid format '$target'. Please choose 'aac' or 'mp3'." >&2
         exit 1
     fi
 fi
-
 log_debug "Target format set to: $target"
 
-# --- Helper: choose fdkaac parameters based on high-frequency energy ---
+# --- Helper: AAC Analysis ---
 analyze_aac_params() {
     local flac_file="$1"
     local r_ref r_mid r_high params
 
-    log_debug "Analyzing AAC quality for: $flac_file"
-
-    r_ref=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1 |
-            awk '/mean_volume/ {print $5}')
-    log_debug "  Full-range mean volume: $r_ref dB"
-
-    r_mid=$(ffmpeg -i "$flac_file" -ac 1 \
-            -af "highpass=f=15500,lowpass=f=17000,volumedetect" \
-            -f null - 2>&1 |
-            awk '/mean_volume/ {print $5}')
-    log_debug "  15.5k-17k band mean volume: $r_mid dB"
-
-    r_high=$(ffmpeg -i "$flac_file" -ac 1 \
-             -af "highpass=f=17000,volumedetect" \
-             -f null - 2>&1 |
-             awk '/mean_volume/ {print $5}')
-    log_debug "  >17k band mean volume: $r_high dB"
+    r_ref=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+    r_mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+    r_high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
 
     params=$(awk -v ref="$r_ref" -v mid="$r_mid" -v high="$r_high" '
     BEGIN {
         d_high = high - ref
         d_mid  = mid - ref
-        if (d_high >= -31.0) {
-            print "-m 5"
-        } else if (d_mid >= -31.0) {
-            print "-m 4 -w 17000"
-        } else {
-            print "-m 4"
-        }
+        if (d_high >= -31.0) print "-m 5"
+        else if (d_mid >= -31.0) print "-m 4 -w 17000"
+        else print "-m 4"
     }')
-    log_debug "  Decision: $params"
     echo "$params"
 }
 
-# --- Prepare summary array ---
-summary_lines=()
+# =============================================================================
+# PHASE 1: PRE-FLIGHT SCAN & VALIDATION
+# =============================================================================
+log_debug "Starting Pre-flight scan..."
 
-# --- Main conversion loop ---
+# Glob files
 for f in *.flac; do
-    # Skip if glob did not match
     [ -e "$f" ] || continue
+    FILE_PATHS+=("$f")
+    # Fix: avoid post-increment returning 0 and triggering set -e
+    TOTAL_TRACKS=$((TOTAL_TRACKS + 1))
+done
 
-    log_debug "--- Processing: $f ---"
+if [ "$TOTAL_TRACKS" -eq 0 ]; then
+    echo "No FLAC files found in the current directory."
+    exit 0
+fi
 
-    # Individual cover temp files
-    cover_raw="/tmp/cover_raw_$(basename "$f" .flac).jpg"
-    cover_opt="/tmp/cover_opt_$(basename "$f" .flac).jpg"
-    rm -f "$cover_raw" "$cover_opt"
-    log_debug "  Cover temp files: raw=$cover_raw, optimized=$cover_opt"
+# Extract initial metadata to arrays and check consistency
+for i in "${!FILE_PATHS[@]}"; do
+    f="${FILE_PATHS[$i]}"
+    
+    t_title=$(metaflac --show-tag=TITLE "$f" 2>/dev/null | cut -d= -f2- || true)
+    t_num=$(metaflac --show-tag=TRACKNUMBER "$f" 2>/dev/null | cut -d= -f2- || true)
+    t_album=$(metaflac --show-tag=ALBUM "$f" 2>/dev/null | cut -d= -f2- || true)
+    t_artist=$(metaflac --show-tag=ARTIST "$f" 2>/dev/null | cut -d= -f2- || true)
+    t_genre=$(metaflac --show-tag=GENRE "$f" 2>/dev/null | cut -d= -f2- || true)
+    t_year=$(metaflac --show-tag=DATE "$f" 2>/dev/null | cut -d= -f2- || true)
 
-    # Extract cover
-    metaflac --export-picture-to="$cover_raw" "$f" 2>/dev/null || true
-    log_debug "  Cover export attempted"
+    TRACK_TITLES+=("$t_title")
+    TRACK_NUMS+=("$t_num")
 
-    # --- Sanitize cover art for iPod (200x200 baseline JPEG) ---
-    if [ -f "$cover_raw" ]; then
-        ffmpeg -y -i "$cover_raw" -vf "scale='min(200,iw)':'min(200,ih)'" \
-            -pix_fmt yuvj420p -frames:v 1 -q:v 5 "$cover_opt" 2>/dev/null
-        log_debug "  Cover sanitized to 200x200 baseline JPEG"
+    # Consistency check for album globals
+    if [ "$i" -eq 0 ]; then
+        ALBUM_TITLE="$t_album"
+        ALBUM_ARTIST="$t_artist"
+        ALBUM_GENRE="$t_genre"
+        ALBUM_YEAR="$t_year"
+        
+        # Try to extract embedded cover from the first track
+        if metaflac --export-picture-to="$TMP_EXTRACTED_COVER" "$f" 2>/dev/null; then
+            ALBUM_COVER="$TMP_EXTRACTED_COVER"
+        fi
     else
-        log_debug "  No cover found, skip sanitization"
+        [ "$ALBUM_TITLE" != "$t_album" ] && ALBUM_TITLE=""
+        [ "$ALBUM_ARTIST" != "$t_artist" ] && ALBUM_ARTIST=""
+        [ "$ALBUM_GENRE" != "$t_genre" ] && ALBUM_GENRE=""
+        [ "$ALBUM_YEAR" != "$t_year" ] && ALBUM_YEAR=""
+    fi
+done
+
+# Interactive Validation Loop
+while true; do
+    clear
+    echo "=== Metadata Validation ==="
+    
+    # Prompt for Album globals
+    read -r -p "Album Title [$ALBUM_TITLE]: " input; [ -n "$input" ] && ALBUM_TITLE="$input"
+    read -r -p "Album Artist [$ALBUM_ARTIST]: " input; [ -n "$input" ] && ALBUM_ARTIST="$input"
+    read -r -p "Genre [$ALBUM_GENRE]: " input; [ -n "$input" ] && ALBUM_GENRE="$input"
+    read -r -p "Release Year [$ALBUM_YEAR]: " input; [ -n "$input" ] && ALBUM_YEAR="$input"
+
+    # Multi-disc prompt
+    read -r -p "Is this a multi-disc release? (y/n) [n]: " is_multidisc
+    if [[ "$is_multidisc" =~ ^[Yy]$ ]]; then
+        read -r -p "Current Disc Number [$DISC_NUM]: " input; [ -n "$input" ] && DISC_NUM="$input"
+        read -r -p "Total Number of Discs [$TOTAL_DISCS]: " input; [ -n "$input" ] && TOTAL_DISCS="$input"
+    else
+        DISC_NUM="1"
+        TOTAL_DISCS="1"
     fi
 
-    TITLE=$(metaflac --show-tag=TITLE "$f" 2>/dev/null | cut -d= -f2- || true)
-    ARTIST=$(metaflac --show-tag=ARTIST "$f" 2>/dev/null | cut -d= -f2- || true)
-    ALBUM=$(metaflac --show-tag=ALBUM "$f" 2>/dev/null | cut -d= -f2- || true)
-    TRACK=$(metaflac --show-tag=TRACKNUMBER "$f" 2>/dev/null | cut -d= -f2- || true)
-    DATE=$(metaflac --show-tag=DATE "$f" 2>/dev/null | cut -d= -f2- || true)
-    GENRE=$(metaflac --show-tag=GENRE "$f" 2>/dev/null | cut -d= -f2- || true)
-    log_debug "  Metadata extracted: title='$TITLE' artist='$ARTIST' album='$ALBUM' track='$TRACK' date='$DATE' genre='$GENRE'"
+    # Cover Art prompt
+    if [ -z "$ALBUM_COVER" ] || [ ! -f "$ALBUM_COVER" ]; then
+        if [ -f "cover.jpg" ] || [ -f "cover.png" ]; then
+            local_cov=$(ls cover.* | head -n 1)
+            read -r -p "Local '$local_cov' found. Use as album cover? (y/n) [y]: " use_local
+            if [[ -z "$use_local" || "$use_local" =~ ^[Yy]$ ]]; then
+                ALBUM_COVER="$local_cov"
+            fi
+        fi
+    fi
+    
+    if [ -z "$ALBUM_COVER" ] || [ ! -f "$ALBUM_COVER" ]; then
+        read -r -p "Provide path to cover image (leave blank to skip): " input
+        [ -n "$input" ] && ALBUM_COVER="$input"
+    fi
+
+    # Track-level validation
+    echo -e "\n--- Validating Tracks ---"
+    for i in "${!FILE_PATHS[@]}"; do
+        if [ -z "${TRACK_TITLES[$i]}" ]; then
+            read -r -p "Missing Title for '${FILE_PATHS[$i]}'. Enter title: " input
+            TRACK_TITLES[$i]="$input"
+        fi
+        if [ -z "${TRACK_NUMS[$i]}" ]; then
+            read -r -p "Missing Track Number for '${FILE_PATHS[$i]}'. Enter number: " input
+            TRACK_NUMS[$i]="$input"
+        fi
+    done
+
+    # Display Summary Form
+    clear
+    echo "========================================"
+    echo "          ALBUM METADATA SUMMARY        "
+    echo "========================================"
+    echo "Artist:      $ALBUM_ARTIST"
+    echo "Album:       $ALBUM_TITLE"
+    echo "Genre:       $ALBUM_GENRE"
+    echo "Year:        $ALBUM_YEAR"
+    echo "Disc:        $DISC_NUM of $TOTAL_DISCS"
+    echo "Cover Path:  ${ALBUM_COVER:-None}"
+    echo "----------------------------------------"
+    for i in "${!FILE_PATHS[@]}"; do
+        printf "%02d - %s (%s)\n" "${TRACK_NUMS[$i]}" "${TRACK_TITLES[$i]}" "${FILE_PATHS[$i]}"
+    done
+    echo "========================================"
+
+    read -r -p "Are the provided details correct? (y - Proceed / n - Edit / c - Cancel): " confirm
+    case "$confirm" in
+        [Yy]*) break ;;
+        [Cc]*) echo "Operation cancelled by user."; exit 0 ;;
+        *) echo "Restarting validation..." ;;
+    esac
+done
+
+# =============================================================================
+# PHASE 2: WORKER (PROCESSING)
+# =============================================================================
+log_debug "Starting Worker Phase..."
+
+# Optimize cover art ONCE for the entire album
+if [ -n "$ALBUM_COVER" ] && [ -f "$ALBUM_COVER" ]; then
+    log_debug "Optimizing cover art: $ALBUM_COVER"
+    ffmpeg -y -i "$ALBUM_COVER" -vf "scale='min(200,iw)':'min(200,ih)'" \
+        -pix_fmt yuvj420p -frames:v 1 -q:v 5 "$TMP_OPT_COVER" 2>/dev/null || true
+else
+    log_debug "No valid cover art provided. Skipping cover optimization."
+fi
+
+# Main processing loop using array indices
+for i in "${!FILE_PATHS[@]}"; do
+    f="${FILE_PATHS[$i]}"
+    log_debug "--- Processing: $f ---"
 
     SAMPLERATE=$(metaflac --show-sample-rate "$f")
     BPS=$(metaflac --show-bps "$f")
-    log_debug "  Source: $BPS-bit @ ${SAMPLERATE}Hz"
-
-    # --- Determine SoX usage and output sample rate ---
+    
+    # Determine SoX usage
     need_sox=false
     sox_detail="none"
     if [ "$target" = "aac" ]; then
         if [ "$BPS" -eq 16 ] && { [ "$SAMPLERATE" -eq 44100 ] || [ "$SAMPLERATE" -eq 48000 ]; }; then
-            need_sox=false
             rate_out="$SAMPLERATE"
         else
             need_sox=true
             rate_out=48000
             sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
         fi
-    else  # mp3
+    else
         if [ "$BPS" -eq 16 ] && [ "$SAMPLERATE" -eq 44100 ]; then
-            need_sox=false
             rate_out=44100
         else
             need_sox=true
@@ -217,129 +304,68 @@ for f in *.flac; do
             sox_detail="${BPS}/${SAMPLERATE%??}k -> 16/${rate_out%??}k"
         fi
     fi
-    log_debug "  Resampling needed: $need_sox, target rate: $rate_out Hz, sox_detail: $sox_detail"
 
-    # --- Encode ---
+    # Encode and Tag
     aac_quality=""
     if [ "$target" = "aac" ]; then
         fdkaac_params=$(analyze_aac_params "$f")
         aac_quality="$fdkaac_params"
-        log_debug "  Encoding to AAC (fdkaac) with: $aac_quality"
+        tmp_naked="/tmp/tmp_naked_$(basename "$f" .flac).m4a"
 
-        # Generate raw AAC audio (naked, no tags, no moov-before-mdat)
-        tmp_naked="tmp_naked_$(basename "$f" .flac).m4a"
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
                 sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
                     -b 16 -t raw - rate -h "$rate_out" | \
-                fdkaac \
-                    -p 2 \
-                    $fdkaac_params \
-                    --raw \
-                    --raw-channels 2 \
-                    --raw-rate "$rate_out" \
-                    --raw-format s16L \
-                    -o "$tmp_naked" -
+                fdkaac -p 2 $fdkaac_params --raw --raw-channels 2 --raw-rate "$rate_out" --raw-format s16L -o "$tmp_naked" -
         else
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                fdkaac \
-                    -p 2 \
-                    $fdkaac_params \
-                    --raw \
-                    --raw-channels 2 \
-                    --raw-rate "$rate_out" \
-                    --raw-format s16L \
-                    -o "$tmp_naked" -
+                fdkaac -p 2 $fdkaac_params --raw --raw-channels 2 --raw-rate "$rate_out" --raw-format s16L -o "$tmp_naked" -
         fi
 
-        # Inject metadata and sanitized cover with AtomicParsley
         cov_flag=()
-        if [ -f "$cover_opt" ]; then
-            cov_flag=(--artwork "$cover_opt")
-        fi
+        [ -f "$TMP_OPT_COVER" ] && cov_flag=(--artwork "$TMP_OPT_COVER")
 
         AtomicParsley "$tmp_naked" \
-            --title "$TITLE" \
-            --artist "$ARTIST" \
-            --album "$ALBUM" \
-            --tracknum "$TRACK" \
-            --year "$DATE" \
-            --genre "$GENRE" \
+            --title "${TRACK_TITLES[$i]}" \
+            --artist "$ALBUM_ARTIST" \
+            --album "$ALBUM_TITLE" \
+            --tracknum "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" \
+            --disk "$DISC_NUM/$TOTAL_DISCS" \
+            --year "$ALBUM_YEAR" \
+            --genre "$ALBUM_GENRE" \
             "${cov_flag[@]}" \
-            --overWrite \
-            >/dev/null 2>&1
+            --overWrite >/dev/null 2>&1
 
-        # Rename to final .m4a
         mv -f "$tmp_naked" "${f%.flac}.m4a"
-        log_debug "  AAC encoding and tagging completed via fdkaac + AtomicParsley"
 
-    else  # mp3
+    else
         srate_lame=$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")
-        log_debug "  Encoding to MP3 (LAME -V 4 @ ${srate_lame}kHz)"
-
-        # Build cover args for LAME (use raw or optimized cover for consistency)
+        
         COVER_ARGS=()
-        if [ -f "$cover_raw" ]; then
-            COVER_ARGS=(--ti "$cover_raw")
-        fi
+        [ -f "$TMP_OPT_COVER" ] && COVER_ARGS=(--ti "$TMP_OPT_COVER")
 
         if $need_sox; then
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
                 sox -G -r "$SAMPLERATE" -c 2 -b "$BPS" -e signed-integer -t raw - \
                     -b 16 -t raw - rate -h "$rate_out" | \
-                lame \
-                    -r \
-                    -s "$srate_lame" \
-                    --bitwidth 16 \
-                    --signed \
-                    --little-endian \
-                    -V 4 \
-                    --tt "$TITLE" \
-                    --ta "$ARTIST" \
-                    --tl "$ALBUM" \
-                    --tn "$TRACK" \
-                    --ty "$DATE" \
-                    --tg "$GENRE" \
-                    "${COVER_ARGS[@]}" \
-                    - "${f%.flac}.mp3"
+                lame -r -s "$srate_lame" --bitwidth 16 --signed --little-endian -V 4 \
+                    --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
+                    --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
+                    --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" - "${f%.flac}.mp3"
         else
             flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                lame \
-                    -r \
-                    -s "$srate_lame" \
-                    --bitwidth 16 \
-                    --signed \
-                    --little-endian \
-                    -V 4 \
-                    --tt "$TITLE" \
-                    --ta "$ARTIST" \
-                    --tl "$ALBUM" \
-                    --tn "$TRACK" \
-                    --ty "$DATE" \
-                    --tg "$GENRE" \
-                    "${COVER_ARGS[@]}" \
-                    - "${f%.flac}.mp3"
+                lame -r -s "$srate_lame" --bitwidth 16 --signed --little-endian -V 4 \
+                    --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
+                    --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
+                    --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" - "${f%.flac}.mp3"
         fi
-        log_debug "  MP3 encoding completed via LAME"
     fi
 
-    # Build summary line
+    # Build summary
     line="$f : SoX: $sox_detail"
-    if [ "$target" = "aac" ]; then
-        line+=" ; AAC: $aac_quality"
-    else
-        line+=" ; MP3: VBR V4"
-    fi
+    [ "$target" = "aac" ] && line+=" ; AAC: $aac_quality" || line+=" ; MP3: VBR V4"
     summary_lines+=("$line")
-    log_debug "  Summary: $line"
-
-    # Clean up individual cover files
-    rm -f "$cover_raw" "$cover_opt"
-    log_debug "  Conversion completed for $f"
 done
-
-# --- Final cleanup of any leftover cover temp files ---
-rm -f /tmp/cover_raw_*.jpg /tmp/cover_opt_*.jpg
 
 # --- Final summary report ---
 echo ""
