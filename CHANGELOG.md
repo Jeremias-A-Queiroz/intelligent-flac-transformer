@@ -1,3 +1,12 @@
+# [0.6.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.5.0...v0.6.0) (2026-08-13)
+
+
+### Features
+
+* extract audio analysis to a pre-flight phase ([5252cc2](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/5252cc28ebf22146a4481f36ee0d4219071a36a2)), closes [#7](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/7)
+
+
+
 # [0.5.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.4.0...v0.5.0) (2026-08-13)
 
 
