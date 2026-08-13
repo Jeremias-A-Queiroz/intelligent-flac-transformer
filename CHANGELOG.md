@@ -1,3 +1,12 @@
+# [0.7.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.6.0...v0.7.0) (2026-08-13)
+
+
+### Features
+
+* local buffer files in wave format ([beb5900](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/beb59008486bab3db19d3ab1544c7e0812fd98f0)), closes [#8](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/8)
+
+
+
 # [0.6.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.5.0...v0.6.0) (2026-08-13)
 
 
