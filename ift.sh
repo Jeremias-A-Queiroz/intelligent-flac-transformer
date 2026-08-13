@@ -14,11 +14,15 @@
 # 0.2.1 - added final summary report showing SoX usage and AAC quality decisions
 # 0.2.2 - removed eval pipeline (spaces in filenames), individual cover temp files
 # 0.3.0 - replaced fdkaac tag injection with AtomicParsley; added cover art sanitization
+# 0.4.0 - replaced fdkaac tag injection with AtomicParsley for iPod container compatibility;
+#         added cover art sanitization (200x200 baseline JPEG); removed ffmpeg repacking step
+#         entirely; kept all audio analysis and SoX logic intact.
 # 0.5.0 - feat: implement interactive pre-flight metadata validation
 #         refactor: decouple tag extraction from audio processing loop
 #         perf: process cover art sanitization only once per album
 #         feat: add support for multi-disc and total tracks tags
 #         fix: bash arithmetic evaluation triggering set -e on track count
+
 
 set -euo pipefail
 
