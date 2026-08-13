@@ -1,3 +1,12 @@
+# [0.5.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.4.0...v0.5.0) (2026-08-13)
+
+
+### Features
+
+* implement interactive pre-flight metadata validation ([e410b86](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/e410b867ece1d70629a708d8df433f02c5aa5e8f)), closes [#6](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/6)
+
+
+
 # [0.4.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.3.1...v0.4.0) (2026-08-12)
 
 
