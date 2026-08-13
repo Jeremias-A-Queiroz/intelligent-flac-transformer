@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ift.sh — Intelligent FLAC transcoder for iPod (AAC) or T-Rex 3 (MP3)
-# Copyright (C) 2025  jeremias@infralinux.com.br
+# Copyright (C) 2025  jeremias@redes.eti.br
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,6 +26,8 @@
 #         feat: add processing strategy summary and confirmation prompt
 #         refactor: worker phase now relies entirely on pre-calculated arrays
 #         style: update interactive prompts to formal English
+# 0.7.0 - refactor: replace raw audio pipes with intermediate WAV files to fix AAC frame truncation and iPod reboots
+#         style: improve final summary report layout to match processing strategy
 
 
 set -euo pipefail
@@ -59,9 +61,10 @@ TRACK_OUT_SRATE=()
 TRACK_AAC_PARAMS=()
 summary_lines=()
 
-# Temp files
-TMP_EXTRACTED_COVER="/tmp/ift_extracted_cover_$$.jpg"
-TMP_OPT_COVER="/tmp/ift_opt_cover_$$.jpg"
+# Temp directory and files
+TMP_DIR=$(mktemp -d /tmp/ift-XXXXXXXX)
+TMP_EXTRACTED_COVER="$TMP_DIR/extracted_cover.jpg"
+TMP_OPT_COVER="$TMP_DIR/opt_cover.jpg"
 
 # --- Parse command-line options ---
 while [[ $# -gt 0 ]]; do
@@ -77,14 +80,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.6.0"
+    echo "ift.sh version 0.7.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.6.0
+Version 0.7.0
 
 Usage: $0 [-mp3|-aac] [-d] [-v] [-h]
   -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
@@ -116,7 +119,8 @@ else
 fi
 
 cleanup() {
-    rm -f "$TMP_EXTRACTED_COVER" "$TMP_OPT_COVER" /tmp/tmp_naked_*.m4a
+    log_debug "Cleaning up temporary directory: $TMP_DIR"
+    rm -rf "$TMP_DIR"
 }
 trap 'log_debug "ERROR occurred (exit code $?). Aborting."; cleanup; echo "Error occurred. Re-run with -d for debug log." >&2; exit 1' ERR
 trap cleanup EXIT
@@ -330,10 +334,9 @@ for i in "${!FILE_PATHS[@]}"; do
         enc_str="LAME: VBR V4"
     fi
     
-    printf "%02d - %s\n    [ %s ] [ %s ]\n" "${TRACK_NUMS[$i]}" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
-    
-    # Store for final summary
-    summary_lines+=("${FILE_PATHS[$i]} : $sox_str ; $enc_str")
+    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ]" "${TRACK_NUMS[$i]}" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
+    echo "$strat_str"
+    summary_lines+=("$strat_str")
 done
 echo "========================================"
 
@@ -360,26 +363,30 @@ for i in "${!FILE_PATHS[@]}"; do
 
     need_sox="${TRACK_NEEDS_SOX[$i]}"
     rate_out="${TRACK_OUT_SRATE[$i]}"
-    srate="${TRACK_SRATE[$i]}"
-    bps="${TRACK_BPS[$i]}"
+    tmp_wav="$TMP_DIR/temp.wav"
+    
+    # Ensure clean state for the temporary WAV
+    rm -f "$tmp_wav"
 
     if [ "$target" = "aac" ]; then
         fdkaac_params="${TRACK_AAC_PARAMS[$i]}"
-        tmp_naked="/tmp/tmp_naked_$(basename "$f" .flac).m4a"
+        tmp_naked="$TMP_DIR/tmp_naked_$(basename "$f" .flac).m4a"
 
         if $need_sox; then
-            flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                sox -G -r "$srate" -c 2 -b "$bps" -e signed-integer -t raw - \
-                    -b 16 -t raw - rate -h "$rate_out" | \
-                fdkaac -p 2 $fdkaac_params --raw --raw-channels 2 --raw-rate "$rate_out" --raw-format s16L -o "$tmp_naked" -
+            log_debug "Decoding and resampling $f to temporary WAV via SoX"
+            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
         else
-            flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                fdkaac -p 2 $fdkaac_params --raw --raw-channels 2 --raw-rate "$rate_out" --raw-format s16L -o "$tmp_naked" -
+            log_debug "Decoding $f directly to temporary WAV"
+            flac -s -f -d "$f" -o "$tmp_wav"
         fi
+
+        log_debug "Encoding WAV to AAC: fdkaac -p 2 $fdkaac_params"
+        fdkaac -p 2 $fdkaac_params -o "$tmp_naked" "$tmp_wav"
 
         cov_flag=()
         [ -f "$TMP_OPT_COVER" ] && cov_flag=(--artwork "$TMP_OPT_COVER")
 
+        log_debug "Injecting metadata via AtomicParsley"
         AtomicParsley "$tmp_naked" \
             --title "${TRACK_TITLES[$i]}" \
             --artist "$ALBUM_ARTIST" \
@@ -394,32 +401,37 @@ for i in "${!FILE_PATHS[@]}"; do
         mv -f "$tmp_naked" "${f%.flac}.m4a"
 
     else
-        srate_lame=$(awk "BEGIN {printf \"%.1f\", $rate_out/1000}")
         COVER_ARGS=()
         [ -f "$TMP_OPT_COVER" ] && COVER_ARGS=(--ti "$TMP_OPT_COVER")
 
         if $need_sox; then
-            flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                sox -G -r "$srate" -c 2 -b "$bps" -e signed-integer -t raw - \
-                    -b 16 -t raw - rate -h "$rate_out" | \
-                lame -r -s "$srate_lame" --bitwidth 16 --signed --little-endian -V 4 \
-                    --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
-                    --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
-                    --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" - "${f%.flac}.mp3"
+            log_debug "Decoding and resampling $f to temporary WAV via SoX"
+            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
         else
-            flac -s -d --force-raw-format --endian=little --sign=signed -c "$f" | \
-                lame -r -s "$srate_lame" --bitwidth 16 --signed --little-endian -V 4 \
-                    --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
-                    --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
-                    --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" - "${f%.flac}.mp3"
+            log_debug "Decoding $f directly to temporary WAV"
+            flac -s -f -d "$f" -o "$tmp_wav"
         fi
+
+        log_debug "Encoding WAV to MP3: lame -V 4"
+        lame -V 4 \
+            --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
+            --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
+            --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" \
+            "$tmp_wav" "${f%.flac}.mp3"
     fi
+    
+    # Clean up the heavy WAV file immediately to save tmpfs/disk space
+    rm -f "$tmp_wav"
 done
 
 # --- Final summary report ---
 echo ""
-echo "========== Conversion Summary =========="
-printf '%s\n' "${summary_lines[@]}"
+echo "========================================"
+echo "          CONVERSION SUMMARY            "
+echo "========================================"
+for line in "${summary_lines[@]}"; do
+    echo "$line"
+done
 echo "========================================"
 
 log_debug "All conversions completed."
