@@ -179,9 +179,9 @@ analyze_nero_params() {
     BEGIN {
         d_high = high - ref
         d_mid  = mid - ref
-        if (d_high >= -31.0) print "-q 0.55"
-        else if (d_mid >= -31.0) print "-q 0.50"
-        else print "-q 0.45"
+        if (d_high >= -31.0) print "0.60"
+        else if (d_mid >= -31.0) print "0.55"
+        else print "0.50"
     }')
     echo "$params"
 }
@@ -289,7 +289,7 @@ while true; do
     echo "Cover Path:  ${ALBUM_COVER:-None}"
     echo "----------------------------------------"
     for i in "${!FILE_PATHS[@]}"; do
-        printf "%02d - %s (%s)\n" "${TRACK_NUMS[$i]}" "${TRACK_TITLES[$i]}" "${FILE_PATHS[$i]}"
+        printf "%02d - %s (%s)\n" "$((10#${TRACK_NUMS[$i]}))" "${TRACK_TITLES[$i]}" "${FILE_PATHS[$i]}"
     done
     echo "========================================"
 
@@ -375,7 +375,7 @@ for i in "${!FILE_PATHS[@]}"; do
         enc_str="LAME: VBR V4"
     fi
     
-    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ]" "${TRACK_NUMS[$i]}" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
+    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
     echo "$strat_str"
     summary_lines+=("$strat_str")
 done
@@ -460,11 +460,11 @@ for i in "${!FILE_PATHS[@]}"; do
         neroAacTag "$tmp_naked" \
             -meta:title="${TRACK_TITLES[$i]}" \
             -meta:artist="$ALBUM_ARTIST" \
-            -meta:"album artist"="$ALBUM_ARTIST" \
+            -meta-user:"album artist"="$ALBUM_ARTIST" \
             -meta:album="$ALBUM_TITLE" \
             -meta:year="$ALBUM_YEAR" \
             -meta:genre="$ALBUM_GENRE" \
-            -meta:track="${TRACK_NUMS[$i]}" \
+            -meta:track="$((10#${TRACK_NUMS[$i]}))" \
             -meta:totaltracks="$TOTAL_TRACKS" \
             -meta:disc="$DISC_NUM" \
             -meta:totaldiscs="$TOTAL_DISCS" \
