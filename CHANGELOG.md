@@ -1,3 +1,17 @@
+# [0.8.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.7.0...v0.8.0) (2026-08-14)
+
+
+### Bug Fixes
+
+* Ajusta parâmetros do Nero e formatação das faixas ([a679c6e](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/a679c6e100e0295061675fbccc0d4bfe07b07ca3))
+
+
+### Features
+
+* **transcode:** adiciona suporte ao encoder Nero AAC ([17f2e44](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/17f2e44ed63809ea8b29748992fe5f2f6186ccc4))
+
+
+
 # [0.7.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.6.0...v0.7.0) (2026-08-13)
 
 
