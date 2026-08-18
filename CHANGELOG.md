@@ -1,3 +1,12 @@
+# [0.9.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.8.0...v0.9.0) (2026-08-18)
+
+
+### Features
+
+* implementa normalização de volume e metadados ([e5523c0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/e5523c09810d21e194a6165c1ef26d0fb6e10449)), closes [#17](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/17)
+
+
+
 # [0.8.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.7.0...v0.8.0) (2026-08-14)
 
 
