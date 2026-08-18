@@ -32,6 +32,7 @@
 #         refactor: move dependency check after target selection to allow dynamic tool requirements
 # 0.9.0 - feat: implement volume normalization tags (iTunNORM and ReplayGain)
 #         refactor: unify audio analysis to improve performance and decouple logic
+# 0.10.0 - feat: implement provenance tracking via log parsing and comment tagging
 
 set -euo pipefail
 export LC_ALL=C # Ensure consistent decimal parsing for awk
@@ -52,6 +53,12 @@ DISC_NUM="1"
 TOTAL_DISCS="1"
 TOTAL_TRACKS=0
 
+# Provenance globals
+ORIGIN_CATALOG=""
+ORIGIN_DISCID=""
+LOG_FOUND=false
+CUE_FOUND=false
+
 # Arrays for track-specific data
 FILE_PATHS=()
 TRACK_TITLES=()
@@ -67,6 +74,7 @@ TRACK_MEAN_VOL=()
 TRACK_ITUNNORM=()
 TRACK_RG_GAIN=()
 TRACK_RG_PEAK=()
+TRACK_PROVENANCE=()
 summary_lines=()
 
 # Temp directory and files
@@ -89,14 +97,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.9.0"
+    echo "ift.sh version 0.10.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.9.0
+Version 0.10.0
 
 Usage: $0 [-aac|-nero|-mp3] [-d] [-v] [-h]
   -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
@@ -155,6 +163,45 @@ done
 # =============================================================================
 # HELPERS: AUDIO ANALYSIS & NORMALIZATION
 # =============================================================================
+
+# Generates provenance string based on log metadata and processing strategy
+generate_provenance() {
+    local bps="$1"
+    local srate_in="$2"
+    local need_sox="$3"
+    local srate_out="$4"
+    local enc_params="$5"
+    
+    local origin="Orig: Unknown"
+    if [ -n "$ORIGIN_CATALOG" ] || [ -n "$ORIGIN_DISCID" ]; then
+        origin="Orig: CD | Cat: ${ORIGIN_CATALOG:-N/A} | ID: ${ORIGIN_DISCID:-N/A}"
+    elif $LOG_FOUND || $CUE_FOUND; then
+        origin="Orig: CD (Verified via Log/Cue)"
+    fi
+
+    local srate_in_fmt
+    srate_in_fmt=$(awk -v sr="$srate_in" 'BEGIN {print sr/1000 "k"}')
+    local srate_out_fmt
+    srate_out_fmt=$(awk -v sr="$srate_out" 'BEGIN {print sr/1000 "k"}')
+    
+    local transform
+    if $need_sox; then
+        transform="Source: FLAC ${bps}/${srate_in_fmt} -> SoX 16/${srate_out_fmt}"
+    else
+        transform="Source: FLAC ${bps}/${srate_in_fmt} (Direct)"
+    fi
+
+    local enc_info
+    if [ "$target" = "aac" ]; then
+        enc_info="FDKAAC ${enc_params}"
+    elif [ "$target" = "nero" ]; then
+        enc_info="Nero AAC -q ${enc_params}"
+    else
+        enc_info="LAME V4"
+    fi
+
+    echo "$origin | $transform | Enc: $enc_info"
+}
 
 # Extracts raw volume levels to avoid running ffmpeg multiple times per track
 extract_audio_levels() {
@@ -247,6 +294,32 @@ if [ "$TOTAL_TRACKS" -eq 0 ]; then
     echo "No FLAC files found in the current directory."
     exit 0
 fi
+
+# Extract log metadata for provenance tracking
+for log_file in *.log; do
+    [ -e "$log_file" ] || continue
+    log_debug "Extracting provenance metadata from log: $log_file"
+    LOG_FOUND=true
+    
+    ORIGIN_DISCID=$(grep -iE -m 1 "(musicbrainz_discid|discid|disc id)[[:space:]]*:" "$log_file" 2>/dev/null | cut -d: -f2- | tr -d '\r' | xargs || true)
+    ORIGIN_CATALOG=$(grep -iE -m 1 "(catalognumber|disc mcn|upc/ean)[[:space:]]*:" "$log_file" 2>/dev/null | cut -d: -f2- | tr -d '\r' | xargs || true)
+    break
+done
+
+# Fallback to .cue file if metadata is still missing
+for cue_file in *.cue; do
+    [ -e "$cue_file" ] || continue
+    log_debug "Extracting provenance metadata from cue: $cue_file"
+    CUE_FOUND=true
+    
+    if [ -z "$ORIGIN_DISCID" ]; then
+        ORIGIN_DISCID=$(grep -iE -m 1 "REM (MUSICBRAINZ_ID|DISCID)" "$cue_file" 2>/dev/null | awk '{print $NF}' | tr -d '"\r' | xargs || true)
+    fi
+    if [ -z "$ORIGIN_CATALOG" ]; then
+        ORIGIN_CATALOG=$(grep -iE -m 1 "^CATALOG|REM CATALOGNUMBER" "$cue_file" 2>/dev/null | awk '{print $NF}' | tr -d '"\r' | xargs || true)
+    fi
+    break
+done
 
 for i in "${!FILE_PATHS[@]}"; do
     f="${FILE_PATHS[$i]}"
@@ -408,6 +481,10 @@ for i in "${!FILE_PATHS[@]}"; do
     TRACK_NEEDS_SOX+=("$need_sox")
     TRACK_OUT_SRATE+=("$rate_out")
     TRACK_AAC_PARAMS+=("$aac_params")
+    
+    # Generate and store provenance string
+    prov=$(generate_provenance "$bps" "$srate" "$need_sox" "$rate_out" "$aac_params")
+    TRACK_PROVENANCE+=("$prov")
 done
 
 # Display Processing Strategy Summary
@@ -437,7 +514,7 @@ for i in "${!FILE_PATHS[@]}"; do
     
     norm_str="Vol: ${TRACK_MEAN_VOL[$i]}dB"
     
-    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ] [ %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str" "$norm_str"
+    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ] [ %s ]\n    [ Prov: %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str" "$norm_str" "${TRACK_PROVENANCE[$i]}"
     echo "$strat_str"
     summary_lines+=("$strat_str")
 done
@@ -501,6 +578,7 @@ for i in "${!FILE_PATHS[@]}"; do
             --disk "$DISC_NUM/$TOTAL_DISCS" \
             --year "$ALBUM_YEAR" \
             --genre "$ALBUM_GENRE" \
+            --comment "${TRACK_PROVENANCE[$i]}" \
             --rDNSatom "$itunnorm_val" name=iTunNORM domain=com.apple.iTunes \
             "${cov_flag[@]}" \
             --overWrite >/dev/null 2>&1
@@ -534,6 +612,7 @@ for i in "${!FILE_PATHS[@]}"; do
             -meta:totaltracks="$TOTAL_TRACKS" \
             -meta:disc="$DISC_NUM" \
             -meta:totaldiscs="$TOTAL_DISCS" \
+            -meta:comment="${TRACK_PROVENANCE[$i]}" \
             -meta-user:iTunNORM="$itunnorm_val" \
             >/dev/null 2>&1
 
@@ -561,6 +640,7 @@ for i in "${!FILE_PATHS[@]}"; do
             --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
             --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
             --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" \
+            --tc "${TRACK_PROVENANCE[$i]}" \
             --tv "TXXX=iTunNORM=$itunnorm_val" \
             --tv "TXXX=replaygain_track_gain=$rg_gain" \
             --tv "TXXX=replaygain_track_peak=$rg_peak" \
