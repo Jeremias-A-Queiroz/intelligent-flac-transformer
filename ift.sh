@@ -30,9 +30,11 @@
 #         style: improve final summary report layout to match processing strategy
 # 0.8.0 - feat: add support for Nero AAC (neroAacEnc/neroAacTag)
 #         refactor: move dependency check after target selection to allow dynamic tool requirements
-
+# 0.9.0 - feat: implement volume normalization tags (iTunNORM and ReplayGain)
+#         refactor: unify audio analysis to improve performance and decouple logic
 
 set -euo pipefail
+export LC_ALL=C # Ensure consistent decimal parsing for awk
 
 # Global flags & variables
 debug=false
@@ -55,12 +57,16 @@ FILE_PATHS=()
 TRACK_TITLES=()
 TRACK_NUMS=()
 
-# Arrays for audio analysis strategy
+# Arrays for audio analysis strategy and normalization
 TRACK_BPS=()
 TRACK_SRATE=()
 TRACK_NEEDS_SOX=()
 TRACK_OUT_SRATE=()
 TRACK_AAC_PARAMS=()
+TRACK_MEAN_VOL=()
+TRACK_ITUNNORM=()
+TRACK_RG_GAIN=()
+TRACK_RG_PEAK=()
 summary_lines=()
 
 # Temp directory and files
@@ -83,14 +89,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.8.0"
+    echo "ift.sh version 0.9.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.8.0
+Version 0.9.0
 
 Usage: $0 [-aac|-nero|-mp3] [-d] [-v] [-h]
   -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
@@ -146,44 +152,84 @@ for cmd in "${deps[@]}"; do
     fi
 done
 
-# --- Helper: AAC Analysis (FDK) ---
-analyze_aac_params() {
+# =============================================================================
+# HELPERS: AUDIO ANALYSIS & NORMALIZATION
+# =============================================================================
+
+# Extracts raw volume levels to avoid running ffmpeg multiple times per track
+extract_audio_levels() {
     local flac_file="$1"
-    local r_ref r_mid r_high params
+    local target_fmt="$2"
+    local mean max mid high vol_out
+    
+    vol_out=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1)
+    mean=$(echo "$vol_out" | awk '/mean_volume/ {print $5}')
+    max=$(echo "$vol_out" | awk '/max_volume/ {print $5}')
+    
+    # Highpass analysis is only required for AAC/Nero adaptive quality
+    if [[ "$target_fmt" == "aac" || "$target_fmt" == "nero" ]]; then
+        mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+        high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+    else
+        mid="-99.0"
+        high="-99.0"
+    fi
+    
+    echo "${mean:-0}|${max:-0}|${mid:-0}|${high:-0}"
+}
 
-    r_ref=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-    r_mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-    r_high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+# Generates Apple iTunNORM metadata string
+calculate_itunnorm() {
+    local mean="$1"
+    local max="$2"
+    awk -v mean="$mean" -v max="$max" '
+    BEGIN {
+        vol_val = int(1000 * (10 ^ (-mean / 10)))
+        peak_val = int(32768 * (10 ^ (max / 20)))
+        if (peak_val > 32767) peak_val = 32767
+        printf " %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", \
+               vol_val, vol_val, vol_val, vol_val, \
+               peak_val, peak_val, peak_val, peak_val, \
+               vol_val, vol_val
+    }'
+}
 
-    params=$(awk -v ref="$r_ref" -v mid="$r_mid" -v high="$r_high" '
+# Generates standard ReplayGain values (Target: -14 LUFS approx)
+calculate_replaygain() {
+    local mean="$1"
+    local max="$2"
+    awk -v mean="$mean" -v max="$max" '
+    BEGIN {
+        gain = -14.0 - mean
+        peak = 10 ^ (max / 20)
+        printf "%+.2f dB|%.6f", gain, peak
+    }'
+}
+
+# Computes FDK AAC parameters based on raw levels
+analyze_aac_params() {
+    local ref="$1" mid="$2" high="$3"
+    awk -v ref="$ref" -v mid="$mid" -v high="$high" '
     BEGIN {
         d_high = high - ref
         d_mid  = mid - ref
         if (d_high >= -31.0) print "-m 5"
         else if (d_mid >= -31.0) print "-m 4 -w 17000"
         else print "-m 4"
-    }')
-    echo "$params"
+    }'
 }
 
-# --- Helper: Nero AAC Analysis ---
+# Computes Nero AAC parameters based on raw levels
 analyze_nero_params() {
-    local flac_file="$1"
-    local r_ref r_mid r_high params
-
-    r_ref=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-    r_mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-    r_high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-
-    params=$(awk -v ref="$r_ref" -v mid="$r_mid" -v high="$r_high" '
+    local ref="$1" mid="$2" high="$3"
+    awk -v ref="$ref" -v mid="$mid" -v high="$high" '
     BEGIN {
         d_high = high - ref
         d_mid  = mid - ref
         if (d_high >= -31.0) print "0.60"
-        else if (d_mid >= -31.0) print "0.55"
-        else print "0.50"
-    }')
-    echo "$params"
+        else if (d_mid >= -31.0) print "0.54"
+        else print "0.48"
+    }'
 }
 
 # =============================================================================
@@ -316,6 +362,20 @@ for i in "${!FILE_PATHS[@]}"; do
     TRACK_SRATE+=("$srate")
     TRACK_BPS+=("$bps")
     
+    # Extract audio levels once
+    levels=$(extract_audio_levels "$f" "$target")
+    IFS='|' read -r mean max mid high <<< "$levels"
+    TRACK_MEAN_VOL+=("$mean")
+    
+    # Calculate normalization tags
+    itunnorm=$(calculate_itunnorm "$mean" "$max")
+    rg_data=$(calculate_replaygain "$mean" "$max")
+    IFS='|' read -r rg_gain rg_peak <<< "$rg_data"
+    
+    TRACK_ITUNNORM+=("$itunnorm")
+    TRACK_RG_GAIN+=("$rg_gain")
+    TRACK_RG_PEAK+=("$rg_peak")
+    
     need_sox=false
     rate_out=44100
     aac_params=""
@@ -327,7 +387,7 @@ for i in "${!FILE_PATHS[@]}"; do
             need_sox=true
             rate_out=48000
         fi
-        aac_params=$(analyze_aac_params "$f")
+        aac_params=$(analyze_aac_params "$mean" "$mid" "$high")
     elif [ "$target" = "nero" ]; then
         if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
             rate_out="$srate"
@@ -335,7 +395,7 @@ for i in "${!FILE_PATHS[@]}"; do
             need_sox=true
             rate_out=48000
         fi
-        aac_params=$(analyze_nero_params "$f")
+        aac_params=$(analyze_nero_params "$mean" "$mid" "$high")
     else
         if [ "$bps" -eq 16 ] && [ "$srate" -eq 44100 ]; then
             rate_out=44100
@@ -375,7 +435,9 @@ for i in "${!FILE_PATHS[@]}"; do
         enc_str="LAME: VBR V4"
     fi
     
-    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str"
+    norm_str="Vol: ${TRACK_MEAN_VOL[$i]}dB"
+    
+    printf -v strat_str "%02d - %s\n    [ %s ] [ %s ] [ %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str" "$norm_str"
     echo "$strat_str"
     summary_lines+=("$strat_str")
 done
@@ -404,6 +466,9 @@ for i in "${!FILE_PATHS[@]}"; do
 
     need_sox="${TRACK_NEEDS_SOX[$i]}"
     rate_out="${TRACK_OUT_SRATE[$i]}"
+    itunnorm_val="${TRACK_ITUNNORM[$i]}"
+    rg_gain="${TRACK_RG_GAIN[$i]}"
+    rg_peak="${TRACK_RG_PEAK[$i]}"
     tmp_wav="$TMP_DIR/temp.wav"
     
     # Ensure clean state for the temporary WAV
@@ -436,6 +501,7 @@ for i in "${!FILE_PATHS[@]}"; do
             --disk "$DISC_NUM/$TOTAL_DISCS" \
             --year "$ALBUM_YEAR" \
             --genre "$ALBUM_GENRE" \
+            --rDNSatom "$itunnorm_val" name=iTunNORM domain=com.apple.iTunes \
             "${cov_flag[@]}" \
             --overWrite >/dev/null 2>&1
 
@@ -468,6 +534,7 @@ for i in "${!FILE_PATHS[@]}"; do
             -meta:totaltracks="$TOTAL_TRACKS" \
             -meta:disc="$DISC_NUM" \
             -meta:totaldiscs="$TOTAL_DISCS" \
+            -meta-user:iTunNORM="$itunnorm_val" \
             >/dev/null 2>&1
 
         if [ -f "$TMP_OPT_COVER" ]; then
@@ -493,7 +560,11 @@ for i in "${!FILE_PATHS[@]}"; do
         lame -V 4 \
             --tt "${TRACK_TITLES[$i]}" --ta "$ALBUM_ARTIST" --tl "$ALBUM_TITLE" \
             --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
-            --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" "${COVER_ARGS[@]}" \
+            --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" \
+            --tv "TXXX=iTunNORM=$itunnorm_val" \
+            --tv "TXXX=replaygain_track_gain=$rg_gain" \
+            --tv "TXXX=replaygain_track_peak=$rg_peak" \
+            "${COVER_ARGS[@]}" \
             "$tmp_wav" "${f%.flac}.mp3"
     fi
     
