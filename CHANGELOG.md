@@ -1,3 +1,12 @@
+# [0.10.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.9.0...v0.10.0) (2026-08-18)
+
+
+### Features
+
+* **metadata:** Adiciona rastreamento de proveniência ([74e370d](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/74e370d05f1d6af3cd32902495cceb8ad351380f)), closes [#19](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/19)
+
+
+
 # [0.9.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.8.0...v0.9.0) (2026-08-18)
 
 
