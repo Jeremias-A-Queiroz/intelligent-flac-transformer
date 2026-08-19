@@ -33,6 +33,8 @@
 # 0.9.0 - feat: implement volume normalization tags (iTunNORM and ReplayGain)
 #         refactor: unify audio analysis to improve performance and decouple logic
 # 0.10.0 - feat: implement provenance tracking via log parsing and comment tagging
+# 0.10.1 - fix: Fixes cover issue in -nero mode
+#               Fix samplerate in bitdepth more than 24bit
 
 set -euo pipefail
 export LC_ALL=C # Ensure consistent decimal parsing for awk
@@ -149,7 +151,7 @@ log_debug "Target format set to: $target"
 deps=(flac sox ffmpeg awk)
 case "$target" in
     aac)  deps+=(fdkaac AtomicParsley) ;;
-    nero) deps+=(neroAacEnc neroAacTag) ;;
+    nero) deps+=(neroAacEnc neroAacTag AtomicParsley) ;;
     mp3)  deps+=(lame) ;;
 esac
 
@@ -453,22 +455,34 @@ for i in "${!FILE_PATHS[@]}"; do
     rate_out=44100
     aac_params=""
 
+
     if [ "$target" = "aac" ]; then
-        if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+	if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
             rate_out="$srate"
-        else
+	else
             need_sox=true
-            rate_out=48000
-        fi
-        aac_params=$(analyze_aac_params "$mean" "$mid" "$high")
+            # Se a taxa original for múltipla de 44.1k (44100, 88200, 176400), sai em 44100
+            if (( srate % 44100 == 0 )); then
+		rate_out=44100
+            else
+		rate_out=48000
+            fi
+	fi
+	aac_params=$(analyze_aac_params "$mean" "$mid" "$high")
     elif [ "$target" = "nero" ]; then
-        if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+	if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
             rate_out="$srate"
-        else
+	else
             need_sox=true
-            rate_out=48000
-        fi
-        aac_params=$(analyze_nero_params "$mean" "$mid" "$high")
+            # If the original rate is a multiple of 44.1k (44100, 88200, 176400), it outputs at 44100.
+            if (( srate % 44100 == 0 )); then
+		rate_out=44100
+            else
+		rate_out=48000
+            fi
+	fi
+	aac_params=$(analyze_nero_params "$mean" "$mid" "$high")
+
     else
         if [ "$bps" -eq 16 ] && [ "$srate" -eq 44100 ]; then
             rate_out=44100
@@ -618,7 +632,7 @@ for i in "${!FILE_PATHS[@]}"; do
 
         if [ -f "$TMP_OPT_COVER" ]; then
             log_debug "Adding cover art via neroAacTag"
-            neroAacTag "$tmp_naked" -add-cover:front:"$TMP_OPT_COVER" >/dev/null 2>&1
+	    AtomicParsley "$tmp_naked" --artwork "$TMP_OPT_COVER" --overWrite >/dev/null 2>&1
         fi
 
         mv -f "$tmp_naked" "${f%.flac}.m4a"
