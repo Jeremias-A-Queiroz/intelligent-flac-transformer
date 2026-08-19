@@ -1,3 +1,12 @@
+## [0.10.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.10.0...v0.10.1) (2026-08-19)
+
+
+### Bug Fixes
+
+* Corrige capa no modo nero e taxa de amostragem ([64729b7](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/64729b7d705b78d240620b44b3aeb1fa5e5f610d)), closes [#25](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/25) [#24](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/24)
+
+
+
 # [0.10.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.9.0...v0.10.0) (2026-08-18)
 
 
