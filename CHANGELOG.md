@@ -1,3 +1,12 @@
+# [0.11.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.10.1...v0.11.0) (2026-08-20)
+
+
+### Features
+
+* Remove conversão forçada para 16-bit ([8043c90](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/8043c90a73014c87b2afbc9f0d4483d25acb0ce8)), closes [#27](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/issues/27)
+
+
+
 ## [0.10.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.10.0...v0.10.1) (2026-08-19)
 
 
