@@ -35,6 +35,7 @@
 # 0.10.0 - feat: implement provenance tracking via log parsing and comment tagging
 # 0.10.1 - fix: Fixes cover issue in -nero mode
 #               Fix samplerate in bitdepth more than 24bit
+# 0.11.0 - refactor: remove unnecessary 24-bit to 16-bit dithering as codecs handle bitdepth natively
 
 set -euo pipefail
 export LC_ALL=C # Ensure consistent decimal parsing for awk
@@ -99,19 +100,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.10.0"
+    echo "ift.sh version 0.11.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.10.0
+Version 0.11.0
 
 Usage: $0 [-aac|-nero|-mp3] [-d] [-v] [-h]
   -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
   -nero   Directly transcode to AAC using Nero encoder (neroAacEnc, adaptive quality)
-  -mp3    Directly transcode to MP3 (LAME V4, 16-bit 44.1kHz)
+  -mp3    Directly transcode to MP3 (LAME V4, 44.1kHz)
   -d      Enable debug logging to debug.log in the current directory
   -v      Print version and exit
   -h      Show this help
@@ -188,7 +189,7 @@ generate_provenance() {
     
     local transform
     if $need_sox; then
-        transform="Source: FLAC ${bps}/${srate_in_fmt} -> SoX 16/${srate_out_fmt}"
+        transform="Source: FLAC ${bps}/${srate_in_fmt} -> SoX ${srate_out_fmt}"
     else
         transform="Source: FLAC ${bps}/${srate_in_fmt} (Direct)"
     fi
@@ -455,36 +456,34 @@ for i in "${!FILE_PATHS[@]}"; do
     rate_out=44100
     aac_params=""
 
-
     if [ "$target" = "aac" ]; then
-	if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+        if [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; then
             rate_out="$srate"
-	else
+        else
             need_sox=true
             # Se a taxa original for múltipla de 44.1k (44100, 88200, 176400), sai em 44100
             if (( srate % 44100 == 0 )); then
-		rate_out=44100
+                rate_out=44100
             else
-		rate_out=48000
+                rate_out=48000
             fi
-	fi
-	aac_params=$(analyze_aac_params "$mean" "$mid" "$high")
+        fi
+        aac_params=$(analyze_aac_params "$mean" "$mid" "$high")
     elif [ "$target" = "nero" ]; then
-	if [ "$bps" -eq 16 ] && { [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; }; then
+        if [ "$srate" -eq 44100 ] || [ "$srate" -eq 48000 ]; then
             rate_out="$srate"
-	else
+        else
             need_sox=true
             # If the original rate is a multiple of 44.1k (44100, 88200, 176400), it outputs at 44100.
             if (( srate % 44100 == 0 )); then
-		rate_out=44100
+                rate_out=44100
             else
-		rate_out=48000
+                rate_out=48000
             fi
-	fi
-	aac_params=$(analyze_nero_params "$mean" "$mid" "$high")
-
+        fi
+        aac_params=$(analyze_nero_params "$mean" "$mid" "$high")
     else
-        if [ "$bps" -eq 16 ] && [ "$srate" -eq 44100 ]; then
+        if [ "$srate" -eq 44100 ]; then
             rate_out=44100
         else
             need_sox=true
@@ -513,7 +512,7 @@ for i in "${!FILE_PATHS[@]}"; do
     bps_in="${TRACK_BPS[$i]}"
     
     if ${TRACK_NEEDS_SOX[$i]}; then
-        sox_str="SoX: ${bps_in}/${srate_in_fmt} -> 16/${srate_out_fmt}"
+        sox_str="SoX: ${bps_in}/${srate_in_fmt} -> ${srate_out_fmt}"
     else
         sox_str="Audio: ${bps_in}/${srate_in_fmt} (Unchanged)"
     fi
@@ -571,7 +570,7 @@ for i in "${!FILE_PATHS[@]}"; do
 
         if $need_sox; then
             log_debug "Decoding and resampling $f to temporary WAV via SoX"
-            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
+            flac -s -d -c "$f" | sox -G -t wav - -t wav "$tmp_wav" rate -h "$rate_out"
         else
             log_debug "Decoding $f directly to temporary WAV"
             flac -s -f -d "$f" -o "$tmp_wav"
@@ -605,7 +604,7 @@ for i in "${!FILE_PATHS[@]}"; do
 
         if $need_sox; then
             log_debug "Decoding and resampling $f to temporary WAV via SoX"
-            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
+            flac -s -d -c "$f" | sox -G -t wav - -t wav "$tmp_wav" rate -h "$rate_out"
         else
             log_debug "Decoding $f directly to temporary WAV"
             flac -s -f -d "$f" -o "$tmp_wav"
@@ -632,7 +631,7 @@ for i in "${!FILE_PATHS[@]}"; do
 
         if [ -f "$TMP_OPT_COVER" ]; then
             log_debug "Adding cover art via neroAacTag"
-	    AtomicParsley "$tmp_naked" --artwork "$TMP_OPT_COVER" --overWrite >/dev/null 2>&1
+            AtomicParsley "$tmp_naked" --artwork "$TMP_OPT_COVER" --overWrite >/dev/null 2>&1
         fi
 
         mv -f "$tmp_naked" "${f%.flac}.m4a"
@@ -643,7 +642,7 @@ for i in "${!FILE_PATHS[@]}"; do
 
         if $need_sox; then
             log_debug "Decoding and resampling $f to temporary WAV via SoX"
-            flac -s -d -c "$f" | sox -G -t wav - -b 16 -t wav "$tmp_wav" rate -h "$rate_out"
+            flac -s -d -c "$f" | sox -G -t wav - -t wav "$tmp_wav" rate -h "$rate_out"
         else
             log_debug "Decoding $f directly to temporary WAV"
             flac -s -f -d "$f" -o "$tmp_wav"
