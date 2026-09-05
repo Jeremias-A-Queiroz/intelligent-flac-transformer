@@ -276,9 +276,9 @@ analyze_nero_params() {
     BEGIN {
         d_high = high - ref
         d_mid  = mid - ref
-        if (d_high >= -31.0) print "0.60"
-        else if (d_mid >= -31.0) print "0.54"
-        else print "0.48"
+        if (d_high >= -31.0) print "0.56"
+        else if (d_mid >= -31.0) print "0.50"
+        else print "0.46"
     }'
 }
 
