@@ -1,3 +1,12 @@
+## [0.11.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.11.0...v0.11.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **nero:** Ajusta os valores de ponderação na análise NERO ([8713462](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/8713462d15aabba19f7c0c4d76485d70193743c7))
+
+
+
 # [0.11.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.10.1...v0.11.0) (2026-08-20)
 
 
