@@ -1,3 +1,12 @@
+# [0.12.0](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.11.1...v0.12.0) (2026-09-07)
+
+
+### Features
+
+* Adiciona análise EBU R128 e tags de Album Gain ([73f47a2](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/commit/73f47a213a8a4dfa8826359e76b1103e8271182a))
+
+
+
 ## [0.11.1](https://github.com/Jeremias-A-Queiroz/intelligent-flac-transformer/compare/v0.11.0...v0.11.1) (2026-09-05)
 
 
