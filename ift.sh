@@ -36,6 +36,8 @@
 # 0.10.1 - fix: Fixes cover issue in -nero mode
 #               Fix samplerate in bitdepth more than 24bit
 # 0.11.0 - refactor: remove unnecessary 24-bit to 16-bit dithering as codecs handle bitdepth natively
+# 0.12.0 - feat: modern EBU R128 loudness analysis using ebur128 filter; align ReplayGain and iTunNORM with beets target (89 dB / -18 LUFS)
+#                and implement proper Album Gain (iTunNORM & ReplayGain Album tags) calculated from consolidated track metrics
 
 set -euo pipefail
 export LC_ALL=C # Ensure consistent decimal parsing for awk
@@ -74,11 +76,20 @@ TRACK_NEEDS_SOX=()
 TRACK_OUT_SRATE=()
 TRACK_AAC_PARAMS=()
 TRACK_MEAN_VOL=()
+TRACK_TRUE_PEAK=()
+TRACK_MID_VOL=()
+TRACK_HIGH_VOL=()
 TRACK_ITUNNORM=()
 TRACK_RG_GAIN=()
 TRACK_RG_PEAK=()
 TRACK_PROVENANCE=()
 summary_lines=()
+
+# Album-wide volume metrics
+ALBUM_INTEGRATED=""
+ALBUM_TRUE_PEAK=""
+ALBUM_RG_GAIN=""
+ALBUM_RG_PEAK=""
 
 # Temp directory and files
 TMP_DIR=$(mktemp -d /tmp/ift-XXXXXXXX)
@@ -100,14 +111,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $show_version; then
-    echo "ift.sh version 0.11.0"
+    echo "ift.sh version 0.13.0"
     exit 0
 fi
 
 if $show_help; then
     cat <<EOF
 ift.sh - Intelligent FLAC Transcoder
-Version 0.11.0
+Version 0.13.0
 
 Usage: $0 [-aac|-nero|-mp3] [-d] [-v] [-h]
   -aac    Directly transcode to AAC (fdkaac, adaptive VBR)
@@ -163,6 +174,14 @@ for cmd in "${deps[@]}"; do
     fi
 done
 
+# Check for either id3v2 or mid3v2 if target is mp3
+if [ "$target" = "mp3" ]; then
+    if ! command -v id3v2 >/dev/null 2>&1 && ! command -v mid3v2 >/dev/null 2>&1; then
+        echo "Error: Required dependency 'id3v2' or 'mid3v2' not found in PATH." >&2
+        exit 1
+    fi
+fi
+
 # =============================================================================
 # HELPERS: AUDIO ANALYSIS & NORMALIZATION
 # =============================================================================
@@ -210,48 +229,85 @@ generate_provenance() {
 extract_audio_levels() {
     local flac_file="$1"
     local target_fmt="$2"
-    local mean max mid high vol_out
     
-    vol_out=$(ffmpeg -i "$flac_file" -ac 1 -af "volumedetect" -f null - 2>&1)
-    mean=$(echo "$vol_out" | awk '/mean_volume/ {print $5}')
-    max=$(echo "$vol_out" | awk '/max_volume/ {print $5}')
-    
-    # Highpass analysis is only required for AAC/Nero adaptive quality
     if [[ "$target_fmt" == "aac" || "$target_fmt" == "nero" ]]; then
-        mid=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=15500,lowpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
-        high=$(ffmpeg -i "$flac_file" -ac 1 -af "highpass=f=17000,volumedetect" -f null - 2>&1 | awk '/mean_volume/ {print $5}')
+        ffmpeg -i "$flac_file" -filter_complex "asplit=3[main][mid][high];[main]ebur128=peak=true[out_main];[mid]highpass=f=15500,lowpass=f=17000,volumedetect[out_mid];[high]highpass=f=17000,volumedetect[out_high]" -map "[out_main]" -f null - -map "[out_mid]" -f null - -map "[out_high]" -f null - 2>&1 | awk '
+        /Integrated loudness/ { sum=1 }
+        sum && /I:/ { i_val=$2 }
+        /True peak/ { tp=1 }
+        tp && /Peak:/ { pk_val=$2 }
+        /Parsed_volumedetect_[0-9]+/ {
+            if (match($0, /Parsed_volumedetect_[0-9]+/)) {
+                filt = substr($0, RSTART, RLENGTH)
+                split(filt, parts, "_")
+                num = parts[3] + 0
+                if ($0 ~ /mean_volume/) {
+                    mean_vol[num] = $5
+                }
+            }
+        }
+        END {
+            min_key = 999999
+            max_key = -1
+            for (k in mean_vol) {
+                if (k < min_key) { min_key = k }
+                if (k > max_key) { max_key = k }
+            }
+            mid_val = (min_key != 999999) ? mean_vol[min_key] : "-99.0"
+            high_val = (max_key != -1 && max_key != min_key) ? mean_vol[max_key] : "-99.0"
+            print (i_val != "" ? i_val : "0") "|" (pk_val != "" ? pk_val : "0") "|" mid_val "|" high_val
+        }'
     else
-        mid="-99.0"
-        high="-99.0"
+        ffmpeg -i "$flac_file" -af ebur128=peak=true -f null - 2>&1 | awk '
+        /Integrated loudness/ { sum=1 }
+        sum && /I:/ { i_val=$2 }
+        /True peak/ { tp=1 }
+        tp && /Peak:/ { pk_val=$2 }
+        END {
+            print (i_val != "" ? i_val : "0") "|" (pk_val != "" ? pk_val : "0") "|-99.0|-99.0"
+        }'
     fi
-    
-    echo "${mean:-0}|${max:-0}|${mid:-0}|${high:-0}"
 }
 
-# Generates Apple iTunNORM metadata string
+# Generates Apple iTunNORM metadata string (Target: -18 LUFS)
 calculate_itunnorm() {
-    local mean="$1"
-    local max="$2"
-    awk -v mean="$mean" -v max="$max" '
+    local track_integrated="$1"
+    local track_peak="$2"
+    local album_integrated="$3"
+    local album_peak="$4"
+    awk -v t_int="$track_integrated" -v t_pk="$track_peak" \
+        -v a_int="$album_integrated" -v a_pk="$album_peak" '
     BEGIN {
-        vol_val = int(1000 * (10 ^ (-mean / 10)))
-        peak_val = int(32768 * (10 ^ (max / 20)))
-        if (peak_val > 32767) peak_val = 32767
+        track_gain = -18.0 - t_int
+        track_peak_linear = 10 ^ (t_pk / 20)
+        
+        album_gain = -18.0 - a_int
+        album_peak_linear = 10 ^ (a_pk / 20)
+        
+        t_vol_dec = int((1000 * (10 ^ (-track_gain / 10))) + 0.5)
+        t_peak_dec = int((32768 * track_peak_linear) + 0.5)
+        
+        a_vol_dec = int((1000 * (10 ^ (-album_gain / 10))) + 0.5)
+        a_peak_dec = int((32768 * album_peak_linear) + 0.5)
+        
+        # Format as upper-case hex with zero-padding to 8 characters
         printf " %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", \
-               vol_val, vol_val, vol_val, vol_val, \
-               peak_val, peak_val, peak_val, peak_val, \
-               vol_val, vol_val
+               t_vol_dec, t_vol_dec, \
+               a_vol_dec, a_vol_dec, \
+               0, 0, \
+               t_peak_dec, t_peak_dec, \
+               a_peak_dec, a_peak_dec
     }'
 }
 
-# Generates standard ReplayGain values (Target: -14 LUFS approx)
+# Generates standard ReplayGain values (Target: -18 LUFS)
 calculate_replaygain() {
-    local mean="$1"
-    local max="$2"
-    awk -v mean="$mean" -v max="$max" '
+    local integrated="$1"
+    local true_peak="$2"
+    awk -v integrated="$integrated" -v true_peak="$true_peak" '
     BEGIN {
-        gain = -14.0 - mean
-        peak = 10 ^ (max / 20)
+        gain = -18.0 - integrated
+        peak = 10 ^ (true_peak / 20)
         printf "%+.2f dB|%.6f", gain, peak
     }'
 }
@@ -429,6 +485,7 @@ done
 log_debug "Starting Audio Pre-analysis Phase..."
 echo "Analyzing audio streams. Please wait..."
 
+# First pass: Extract track metadata and audio levels
 for i in "${!FILE_PATHS[@]}"; do
     f="${FILE_PATHS[$i]}"
     
@@ -442,9 +499,66 @@ for i in "${!FILE_PATHS[@]}"; do
     levels=$(extract_audio_levels "$f" "$target")
     IFS='|' read -r mean max mid high <<< "$levels"
     TRACK_MEAN_VOL+=("$mean")
-    
-    # Calculate normalization tags
-    itunnorm=$(calculate_itunnorm "$mean" "$max")
+    TRACK_TRUE_PEAK+=("$max")
+    TRACK_MID_VOL+=("$mid")
+    TRACK_HIGH_VOL+=("$high")
+done
+
+# Calculate Album Loudness (energy average of track integrated loudness levels)
+ALBUM_INTEGRATED=$(awk '
+BEGIN {
+    sum = 0
+    count = 0
+}
+{
+    sum += 10 ^ ($1 / 10)
+    count++
+}
+END {
+    if (count > 0) {
+        avg = sum / count
+        if (avg > 0) {
+            printf "%.2f", 10 * log(avg) / log(10)
+        } else {
+            print "-99.00"
+        }
+    } else {
+        print "-18.00"
+    }
+}' <<< "$(printf "%s\n" "${TRACK_MEAN_VOL[@]}")")
+
+# Calculate Album Peak (maximum of track true peak levels)
+ALBUM_TRUE_PEAK=$(awk '
+BEGIN {
+    max = -99.0
+    first = 1
+}
+{
+    val = $1 + 0
+    if (first || val > max) {
+        max = val
+        first = 0
+    }
+}
+END {
+    printf "%.2f", max
+}' <<< "$(printf "%s\n" "${TRACK_TRUE_PEAK[@]}")")
+
+ALBUM_RG_DATA=$(calculate_replaygain "$ALBUM_INTEGRATED" "$ALBUM_TRUE_PEAK")
+IFS='|' read -r ALBUM_RG_GAIN ALBUM_RG_PEAK <<< "$ALBUM_RG_DATA"
+
+# Second pass: Compute track strategies and tags
+for i in "${!FILE_PATHS[@]}"; do
+    f="${FILE_PATHS[$i]}"
+    srate="${TRACK_SRATE[$i]}"
+    bps="${TRACK_BPS[$i]}"
+    mean="${TRACK_MEAN_VOL[$i]}"
+    max="${TRACK_TRUE_PEAK[$i]}"
+    mid="${TRACK_MID_VOL[$i]}"
+    high="${TRACK_HIGH_VOL[$i]}"
+
+    # Calculate normalization tags using both track and album metrics
+    itunnorm=$(calculate_itunnorm "$mean" "$max" "$ALBUM_INTEGRATED" "$ALBUM_TRUE_PEAK")
     rg_data=$(calculate_replaygain "$mean" "$max")
     IFS='|' read -r rg_gain rg_peak <<< "$rg_data"
     
@@ -505,6 +619,8 @@ clear
 echo "========================================"
 echo "      PROCESSING STRATEGY SUMMARY       "
 echo "========================================"
+echo "Album Loudness: ${ALBUM_INTEGRATED} LUFS | Album Gain: ${ALBUM_RG_GAIN} | Album Peak: ${ALBUM_TRUE_PEAK} dBFS"
+echo "----------------------------------------"
 
 for i in "${!FILE_PATHS[@]}"; do
     srate_in_fmt=$(awk "BEGIN {print ${TRACK_SRATE[$i]}/1000 \"k\"}")
@@ -525,7 +641,7 @@ for i in "${!FILE_PATHS[@]}"; do
         enc_str="LAME: VBR V4"
     fi
     
-    norm_str="Vol: ${TRACK_MEAN_VOL[$i]}dB"
+    norm_str="Vol: ${TRACK_MEAN_VOL[$i]} LUFS (Album Gain: $ALBUM_RG_GAIN)"
     
     printf -v strat_str "%02d - %s\n    [ %s ] [ %s ] [ %s ]\n    [ Prov: %s ]" "$((10#${TRACK_NUMS[$i]}))" "${FILE_PATHS[$i]}" "$sox_str" "$enc_str" "$norm_str" "${TRACK_PROVENANCE[$i]}"
     echo "$strat_str"
@@ -593,6 +709,10 @@ for i in "${!FILE_PATHS[@]}"; do
             --genre "$ALBUM_GENRE" \
             --comment "${TRACK_PROVENANCE[$i]}" \
             --rDNSatom "$itunnorm_val" name=iTunNORM domain=com.apple.iTunes \
+            --rDNSatom "$rg_gain" name=replaygain_track_gain domain=com.apple.iTunes \
+            --rDNSatom "$rg_peak" name=replaygain_track_peak domain=com.apple.iTunes \
+            --rDNSatom "$ALBUM_RG_GAIN" name=replaygain_album_gain domain=com.apple.iTunes \
+            --rDNSatom "$ALBUM_RG_PEAK" name=replaygain_album_peak domain=com.apple.iTunes \
             "${cov_flag[@]}" \
             --overWrite >/dev/null 2>&1
 
@@ -627,6 +747,10 @@ for i in "${!FILE_PATHS[@]}"; do
             -meta:totaldiscs="$TOTAL_DISCS" \
             -meta:comment="${TRACK_PROVENANCE[$i]}" \
             -meta-user:iTunNORM="$itunnorm_val" \
+            -meta-user:replaygain_track_gain="$rg_gain" \
+            -meta-user:replaygain_track_peak="$rg_peak" \
+            -meta-user:replaygain_album_gain="$ALBUM_RG_GAIN" \
+            -meta-user:replaygain_album_peak="$ALBUM_RG_PEAK" \
             >/dev/null 2>&1
 
         if [ -f "$TMP_OPT_COVER" ]; then
@@ -654,11 +778,20 @@ for i in "${!FILE_PATHS[@]}"; do
             --tn "${TRACK_NUMS[$i]}/$TOTAL_TRACKS" --ty "$ALBUM_YEAR" --tg "$ALBUM_GENRE" \
             --tv "TPOS=$DISC_NUM/$TOTAL_DISCS" \
             --tc "${TRACK_PROVENANCE[$i]}" \
-            --tv "TXXX=iTunNORM=$itunnorm_val" \
             --tv "TXXX=replaygain_track_gain=$rg_gain" \
             --tv "TXXX=replaygain_track_peak=$rg_peak" \
+            --tv "TXXX=replaygain_album_gain=$ALBUM_RG_GAIN" \
+            --tv "TXXX=replaygain_album_peak=$ALBUM_RG_PEAK" \
             "${COVER_ARGS[@]}" \
             "$tmp_wav" "${f%.flac}.mp3"
+
+        local id3_tool=""
+        if command -v id3v2 >/dev/null 2>&1; then
+            id3_tool="id3v2"
+        else
+            id3_tool="mid3v2"
+        fi
+        $id3_tool -c "iTunNORM":"$itunnorm_val":"eng" "${f%.flac}.mp3" >/dev/null 2>&1
     fi
     
     # Clean up the heavy WAV file immediately to save tmpfs/disk space
